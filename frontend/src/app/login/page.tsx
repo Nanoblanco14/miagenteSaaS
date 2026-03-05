@@ -13,6 +13,7 @@ export default function LoginPage() {
     const [showPw, setShowPw] = useState(false);
     const [error, setError] = useState("");
     const [loading, setLoading] = useState(false);
+    const [signupSuccess, setSignupSuccess] = useState(false);
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -23,8 +24,12 @@ export default function LoginPage() {
             if (isLogin) {
                 const { error } = await supabase.auth.signInWithPassword({ email, password });
                 if (error) throw error;
+                // Login: redirect to dashboard
+                router.refresh();
+                await new Promise(resolve => setTimeout(resolve, 300));
+                router.push("/dashboard");
             } else {
-                // Register
+                // Register — Supabase requires email confirmation before login
                 const { data: authData, error: authError } = await supabase.auth.signUp({ email, password });
                 if (authError) throw authError;
 
@@ -43,13 +48,10 @@ export default function LoginPage() {
                         throw new Error(err.error || "Failed to create organization");
                     }
                 }
-            }
 
-            // Force server to recognize the new cookie, then redirect
-            router.refresh();
-            // Small delay to let the cookie sync complete
-            await new Promise(resolve => setTimeout(resolve, 300));
-            router.push("/dashboard");
+                // Show confirmation message instead of auto-login
+                setSignupSuccess(true);
+            }
         } catch (err: any) {
             setError(err.message || "Error de autenticación");
         }
@@ -102,17 +104,34 @@ export default function LoginPage() {
                     </p>
                 </div>
 
-                {error && (
+                {signupSuccess ? (
                     <div style={{
-                        padding: "12px 16px", background: "rgba(239,68,68,0.1)",
-                        border: "1px solid rgba(239,68,68,0.3)", borderRadius: "var(--radius)",
-                        color: "#f87171", fontSize: "0.8rem", marginBottom: "20px",
+                        padding: "16px", background: "rgba(34,197,94,0.1)",
+                        border: "1px solid rgba(34,197,94,0.3)", borderRadius: "var(--radius)",
+                        color: "#4ade80", fontSize: "0.85rem", lineHeight: 1.6,
+                        textAlign: "center",
                     }}>
-                        {error}
+                        <strong style={{ display: "block", marginBottom: "6px", fontSize: "0.95rem" }}>
+                            ✅ ¡Cuenta creada con éxito!
+                        </strong>
+                        Por favor, revisa tu bandeja de entrada (y la carpeta de spam) para confirmar
+                        tu correo electrónico antes de iniciar sesión.
                     </div>
+                ) : (
+                    <>
+                        {error && (
+                            <div style={{
+                                padding: "12px 16px", background: "rgba(239,68,68,0.1)",
+                                border: "1px solid rgba(239,68,68,0.3)", borderRadius: "var(--radius)",
+                                color: "#f87171", fontSize: "0.8rem", marginBottom: "20px",
+                            }}>
+                                {error}
+                            </div>
+                        )}
+                    </>
                 )}
 
-                <form onSubmit={handleSubmit}>
+                {!signupSuccess && <form onSubmit={handleSubmit}>
                     {!isLogin && (
                         <div className="form-group">
                             <label className="form-label">Nombre de tu organización</label>
@@ -154,21 +173,34 @@ export default function LoginPage() {
                             isLogin ? "Iniciar Sesión" : "Crear Cuenta"
                         )}
                     </button>
-                </form>
+                </form>}
 
-                <div style={{
-                    textAlign: "center", marginTop: "20px", fontSize: "0.8rem",
-                    color: "var(--text-muted)",
-                }}>
-                    {isLogin ? "¿No tienes cuenta?" : "¿Ya tienes cuenta?"}{" "}
-                    <button onClick={() => { setIsLogin(!isLogin); setError(""); }}
-                        style={{
-                            background: "none", border: "none", cursor: "pointer",
-                            color: "var(--accent-light)", fontWeight: 600, fontSize: "0.8rem",
-                        }}>
-                        {isLogin ? "Regístrate" : "Inicia sesión"}
-                    </button>
-                </div>
+                {!signupSuccess && (
+                    <div style={{
+                        textAlign: "center", marginTop: "20px", fontSize: "0.8rem",
+                        color: "var(--text-muted)",
+                    }}>
+                        {isLogin ? "¿No tienes cuenta?" : "¿Ya tienes cuenta?"}{" "}
+                        <button onClick={() => { setIsLogin(!isLogin); setError(""); setSignupSuccess(false); }}
+                            style={{
+                                background: "none", border: "none", cursor: "pointer",
+                                color: "var(--accent-light)", fontWeight: 600, fontSize: "0.8rem",
+                            }}>
+                            {isLogin ? "Regístrate" : "Inicia sesión"}
+                        </button>
+                    </div>
+                )}
+                {signupSuccess && (
+                    <div style={{ textAlign: "center", marginTop: "16px" }}>
+                        <button onClick={() => { setIsLogin(true); setSignupSuccess(false); }}
+                            style={{
+                                background: "none", border: "none", cursor: "pointer",
+                                color: "var(--accent-light)", fontWeight: 600, fontSize: "0.85rem",
+                            }}>
+                            → Ir a Iniciar Sesión
+                        </button>
+                    </div>
+                )}
             </div>
         </div>
     );

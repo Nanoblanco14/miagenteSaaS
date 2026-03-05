@@ -5,8 +5,9 @@ import { updateTenantSettings, loadTenantSettings } from "./actions";
 import {
     Settings, Building2, Key, Wifi,
     Eye, EyeOff, Check, Copy, Loader2, Save,
-    AlertCircle, Phone, MessageCircle,
+    AlertCircle, Phone, MessageCircle, ExternalLink,
 } from "lucide-react";
+import Link from "next/link";
 
 type WhatsAppProvider = "twilio" | "meta";
 
@@ -100,12 +101,24 @@ export default function SettingsPage() {
     const [showKey, setShowKey] = useState(false);
     const [provider, setProvider] = useState<WhatsAppProvider>("twilio");
     const [credentials, setCredentials] = useState<Record<string, string>>({});
+    // Guided Meta fields (shown in the easy setup card)
+    const [metaToken, setMetaToken] = useState("");
+    const [metaPhoneId, setMetaPhoneId] = useState("");
     const [copied, setCopied] = useState(false);
 
     useEffect(() => {
         (async () => {
             const data = await loadTenantSettings(organization.id);
-            if (data) { setApiKey(data.openai_api_key); setProvider(data.whatsapp_provider); setCredentials(data.whatsapp_credentials); }
+            if (data) {
+                setApiKey(data.openai_api_key);
+                setProvider(data.whatsapp_provider);
+                setCredentials(data.whatsapp_credentials);
+                // Pre-fill guided Meta fields if already saved
+                if (data.whatsapp_credentials?.access_token)
+                    setMetaToken(data.whatsapp_credentials.access_token);
+                if (data.whatsapp_credentials?.phone_number_id)
+                    setMetaPhoneId(data.whatsapp_credentials.phone_number_id);
+            }
             setLoading(false);
         })();
     }, [organization.id]);
@@ -181,7 +194,105 @@ export default function SettingsPage() {
                     </div>
                 </SectionCard>
 
-                <SectionCard icon={<Wifi size={16} />} title="Proveedor de WhatsApp" subtitle="Elige tu proveedor y guarda las credenciales"
+                {/* ── Guided WhatsApp Business Setup ───────────────── */}
+                <SectionCard
+                    icon={<MessageCircle size={16} />}
+                    title="Conecta tu WhatsApp Business"
+                    subtitle="Sigue estos pasos para obtener tus credenciales de Meta Cloud API"
+                    footer={
+                        <SaveButton
+                            label="Guardar Configuración"
+                            section="whatsapp-meta"
+                            saving={saving}
+                            saved={saved}
+                            onClick={() =>
+                                saveSection("whatsapp-meta", {
+                                    orgId: organization.id,
+                                    whatsapp_provider: "meta",
+                                    whatsapp_credentials: {
+                                        ...credentials,
+                                        access_token: metaToken,
+                                        phone_number_id: metaPhoneId,
+                                    },
+                                })
+                            }
+                        />
+                    }
+                >
+                    {/* Step-by-step instructions */}
+                    <ol style={{
+                        paddingLeft: "18px",
+                        margin: "0 0 20px",
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: "10px",
+                        fontSize: "0.83rem",
+                        color: "var(--text-secondary)",
+                        lineHeight: 1.6,
+                    }}>
+                        <li>
+                            <a
+                                href="https://developers.facebook.com/"
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                style={{
+                                    color: "#60a5fa",
+                                    textDecoration: "underline",
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    gap: "4px",
+                                    fontWeight: 600,
+                                }}
+                            >
+                                Haz clic aquí para ir a Meta for Developers y crear tu App
+                                <ExternalLink size={12} />
+                            </a>
+                            {" — "}
+                            Crea una App de tipo <strong>Business</strong>.
+                        </li>
+                        <li>
+                            Dentro de tu App, ve a <strong>WhatsApp → API Setup</strong>.
+                            Copia el <strong>Temporary Access Token</strong> (o genera uno permanente)
+                            y el <strong>Phone Number ID</strong> del número asociado.
+                        </li>
+                        <li>
+                            Pega esos valores en los campos de abajo y haz clic en
+                            <strong> Guardar Configuración</strong>.
+                        </li>
+                    </ol>
+
+                    <div className="grid gap-3">
+                        <div className="form-group" style={{ marginBottom: 0 }}>
+                            <label className="form-label">Token de Acceso (Access Token)</label>
+                            <input
+                                className="input"
+                                type="password"
+                                value={metaToken}
+                                onChange={(e) => setMetaToken(e.target.value)}
+                                placeholder="EAAGm0PX4ZCpsBAG..."
+                            />
+                            <p className="text-xs mt-1" style={{ color: "var(--text-muted)" }}>
+                                Token permanente generado desde Meta for Developers.
+                            </p>
+                        </div>
+                        <div className="form-group" style={{ marginBottom: 0 }}>
+                            <label className="form-label">Identificador de Número de Teléfono (Phone Number ID)</label>
+                            <input
+                                className="input"
+                                type="text"
+                                value={metaPhoneId}
+                                onChange={(e) => setMetaPhoneId(e.target.value)}
+                                placeholder="123456789012345"
+                            />
+                            <p className="text-xs mt-1" style={{ color: "var(--text-muted)" }}>
+                                ID numérico — no es tu número de teléfono.
+                            </p>
+                        </div>
+                    </div>
+                </SectionCard>
+
+                {/* ── Advanced WhatsApp Provider Settings ───────────── */}
+                <SectionCard icon={<Wifi size={16} />} title="Proveedor de WhatsApp (Avanzado)" subtitle="Elige tu proveedor y guarda las credenciales"
                     footer={<SaveButton label="Guardar WhatsApp" section="whatsapp" saving={saving} saved={saved}
                         onClick={() => saveSection("whatsapp", { orgId: organization.id, whatsapp_provider: provider, whatsapp_credentials: credentials })} />}>
                     {/* Provider toggle */}
