@@ -1,12 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseAdmin } from "@/lib/supabase";
+import { authenticateRequest, verifyOrgAccess, apiError, serverError } from "@/lib/api-auth";
 
 // ── GET /api/pipeline?org_id=xxx ───────────────────────────
 // Returns all stages (ordered by position) with their leads
 export async function GET(req: NextRequest) {
     try {
+        const result = await authenticateRequest("pipeline:GET");
+        if ("error" in result) return result.error;
+        const { auth } = result;
+
         const orgId = req.nextUrl.searchParams.get("org_id");
-        if (!orgId) return NextResponse.json({ error: "org_id required" }, { status: 400 });
+        if (!orgId) return apiError("org_id required", 400, "MISSING_PARAM");
+
+        const orgCheck = verifyOrgAccess(auth, orgId);
+        if (orgCheck) return orgCheck;
 
         const db = getSupabaseAdmin();
 
@@ -35,7 +43,7 @@ export async function GET(req: NextRequest) {
         }));
 
         return NextResponse.json({ data: pipeline });
-    } catch (err: any) {
-        return NextResponse.json({ error: err.message }, { status: 500 });
+    } catch (err) {
+        return serverError(err, "pipeline:GET");
     }
 }

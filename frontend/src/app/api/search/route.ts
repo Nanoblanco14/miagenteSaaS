@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseAdmin } from "@/lib/supabase";
 import { generateEmbedding } from "@/lib/openai";
+import { authenticateRequest, verifyOrgAccess, apiError, serverError } from "@/lib/api-auth";
 import type { SearchRequest, SearchResult } from "@/lib/types";
 
 // ── POST /api/search ───────────────────────────────────────
@@ -8,12 +9,19 @@ import type { SearchRequest, SearchResult } from "@/lib/types";
 // Uses pgvector cosine similarity via the match_products RPC
 export async function POST(req: NextRequest) {
     try {
+        const result = await authenticateRequest("search:POST");
+        if ("error" in result) return result.error;
+        const { auth } = result;
+
         const body: SearchRequest = await req.json();
         const { query, organization_id, threshold = 0.5, limit = 10 } = body;
 
         if (!query || !organization_id) {
-            return NextResponse.json({ error: "query and organization_id required" }, { status: 400 });
+            return apiError("query and organization_id required", 400, "MISSING_FIELDS");
         }
+
+        const orgCheck = verifyOrgAccess(auth, organization_id);
+        if (orgCheck) return orgCheck;
 
         // 1. Generate embedding for the search query
         const queryEmbedding = await generateEmbedding(query);
@@ -38,7 +46,7 @@ export async function POST(req: NextRequest) {
         }));
 
         return NextResponse.json({ data: results });
-    } catch (err: any) {
-        return NextResponse.json({ error: err.message }, { status: 500 });
+    } catch (err) {
+        return serverError(err, "search:POST");
     }
 }

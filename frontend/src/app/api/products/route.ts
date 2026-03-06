@@ -1,13 +1,21 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseAdmin } from "@/lib/supabase";
 import { generateEmbedding, buildProductText } from "@/lib/openai";
+import { authenticateRequest, verifyOrgAccess, apiError, serverError } from "@/lib/api-auth";
 import type { ProductCreate } from "@/lib/types";
 
 // ── GET /api/products?org_id=xxx ───────────────────────────
 export async function GET(req: NextRequest) {
     try {
+        const result = await authenticateRequest("products:GET");
+        if ("error" in result) return result.error;
+        const { auth } = result;
+
         const orgId = req.nextUrl.searchParams.get("org_id");
-        if (!orgId) return NextResponse.json({ error: "org_id required" }, { status: 400 });
+        if (!orgId) return apiError("org_id required", 400, "MISSING_PARAM");
+
+        const orgCheck = verifyOrgAccess(auth, orgId);
+        if (orgCheck) return orgCheck;
 
         const db = getSupabaseAdmin();
         const { data, error } = await db
@@ -18,31 +26,36 @@ export async function GET(req: NextRequest) {
 
         if (error) throw error;
         return NextResponse.json({ data });
-    } catch (err: any) {
-        return NextResponse.json({ error: err.message }, { status: 500 });
+    } catch (err) {
+        return serverError(err, "products:GET");
     }
 }
 
 // ── POST /api/products ─────────────────────────────────────
 export async function POST(req: NextRequest) {
     try {
+        const result = await authenticateRequest("products:POST");
+        if ("error" in result) return result.error;
+        const { auth } = result;
+
         const body: ProductCreate = await req.json();
         const { organization_id, name, description, attributes } = body;
 
         if (!organization_id || !name) {
-            return NextResponse.json({ error: "organization_id and name required" }, { status: 400 });
+            return apiError("organization_id and name required", 400, "MISSING_FIELDS");
         }
 
-        // 1. Generate embedding from product text
+        const orgCheck = verifyOrgAccess(auth, organization_id);
+        if (orgCheck) return orgCheck;
+
         const productText = buildProductText({ name, description: description || "", attributes: attributes || {} });
         let embedding: number[] | null = null;
         try {
             embedding = await generateEmbedding(productText);
         } catch (e) {
-            console.error("Embedding generation failed (product will be saved without embedding):", e);
+            console.error("[API:products:POST] Embedding generation failed:", e);
         }
 
-        // 2. Insert product with embedding
         const db = getSupabaseAdmin();
         const insertData: Record<string, unknown> = {
             organization_id,
@@ -62,7 +75,7 @@ export async function POST(req: NextRequest) {
 
         if (error) throw error;
         return NextResponse.json({ data }, { status: 201 });
-    } catch (err: any) {
-        return NextResponse.json({ error: err.message }, { status: 500 });
+    } catch (err) {
+        return serverError(err, "products:POST");
     }
 }

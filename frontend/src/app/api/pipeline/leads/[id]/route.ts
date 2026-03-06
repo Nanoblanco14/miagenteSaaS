@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseAdmin } from "@/lib/supabase";
+import { authenticateRequest, apiError, serverError } from "@/lib/api-auth";
 
 // ── PUT /api/pipeline/leads/[id] ──────────────────────────
 // Update a lead (stage, name, phone, notes)
@@ -8,8 +9,24 @@ export async function PUT(
     { params }: { params: Promise<{ id: string }> }
 ) {
     try {
+        const result = await authenticateRequest("leads:PUT");
+        if ("error" in result) return result.error;
+        const { auth } = result;
+
         const { id } = await params;
         const body = await req.json();
+        const db = getSupabaseAdmin();
+
+        // Verify the lead belongs to the user's org
+        const { data: existing } = await db
+            .from("leads")
+            .select("organization_id")
+            .eq("id", id)
+            .single();
+
+        if (!existing || existing.organization_id !== auth.orgId) {
+            return apiError("Lead no encontrado", 404, "NOT_FOUND");
+        }
 
         // Build dynamic update payload
         const updatePayload: Record<string, unknown> = {};
@@ -23,10 +40,9 @@ export async function PUT(
         if (body.is_bot_paused !== undefined) updatePayload.is_bot_paused = body.is_bot_paused;
 
         if (Object.keys(updatePayload).length === 0) {
-            return NextResponse.json({ error: "No fields to update" }, { status: 400 });
+            return apiError("No fields to update", 400, "EMPTY_UPDATE");
         }
 
-        const db = getSupabaseAdmin();
         const { data, error } = await db
             .from("leads")
             .update(updatePayload)
@@ -36,8 +52,8 @@ export async function PUT(
 
         if (error) throw error;
         return NextResponse.json({ data });
-    } catch (err: any) {
-        return NextResponse.json({ error: err.message }, { status: 500 });
+    } catch (err) {
+        return serverError(err, "leads:PUT");
     }
 }
 
@@ -48,12 +64,28 @@ export async function DELETE(
     { params }: { params: Promise<{ id: string }> }
 ) {
     try {
+        const result = await authenticateRequest("leads:DELETE");
+        if ("error" in result) return result.error;
+        const { auth } = result;
+
         const { id } = await params;
         const db = getSupabaseAdmin();
+
+        // Verify the lead belongs to the user's org
+        const { data: existing } = await db
+            .from("leads")
+            .select("organization_id")
+            .eq("id", id)
+            .single();
+
+        if (!existing || existing.organization_id !== auth.orgId) {
+            return apiError("Lead no encontrado", 404, "NOT_FOUND");
+        }
+
         const { error } = await db.from("leads").delete().eq("id", id);
         if (error) throw error;
         return NextResponse.json({ success: true });
-    } catch (err: any) {
-        return NextResponse.json({ error: err.message }, { status: 500 });
+    } catch (err) {
+        return serverError(err, "leads:DELETE");
     }
 }

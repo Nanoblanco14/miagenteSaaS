@@ -1,19 +1,24 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseAdmin } from "@/lib/supabase";
+import { authenticateRequest, verifyOrgAccess, apiError, serverError } from "@/lib/api-auth";
 import type { LeadCreate } from "@/lib/types";
 
 // ── POST /api/pipeline/leads ──────────────────────────────
 // Create a new lead
 export async function POST(req: NextRequest) {
     try {
+        const result = await authenticateRequest("leads:POST");
+        if ("error" in result) return result.error;
+        const { auth } = result;
+
         const body: LeadCreate = await req.json();
 
         if (!body.organization_id || !body.stage_id || !body.name) {
-            return NextResponse.json(
-                { error: "organization_id, stage_id, and name are required" },
-                { status: 400 }
-            );
+            return apiError("organization_id, stage_id, and name are required", 400, "MISSING_FIELDS");
         }
+
+        const orgCheck = verifyOrgAccess(auth, body.organization_id);
+        if (orgCheck) return orgCheck;
 
         const db = getSupabaseAdmin();
         const { data, error } = await db
@@ -33,7 +38,7 @@ export async function POST(req: NextRequest) {
 
         if (error) throw error;
         return NextResponse.json({ data }, { status: 201 });
-    } catch (err: any) {
-        return NextResponse.json({ error: err.message }, { status: 500 });
+    } catch (err) {
+        return serverError(err, "leads:POST");
     }
 }

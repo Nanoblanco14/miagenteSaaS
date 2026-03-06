@@ -1,12 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseAdmin } from "@/lib/supabase";
+import { authenticateRequest, verifyOrgAccess, apiError, serverError } from "@/lib/api-auth";
 import type { AgentCreate } from "@/lib/types";
 
 // ── GET /api/agents?org_id=xxx ─────────────────────────────
 export async function GET(req: NextRequest) {
     try {
+        const result = await authenticateRequest("agents:GET");
+        if ("error" in result) return result.error;
+        const { auth } = result;
+
         const orgId = req.nextUrl.searchParams.get("org_id");
-        if (!orgId) return NextResponse.json({ error: "org_id required" }, { status: 400 });
+        if (!orgId) return apiError("org_id required", 400, "MISSING_PARAM");
+
+        const orgCheck = verifyOrgAccess(auth, orgId);
+        if (orgCheck) return orgCheck;
 
         const db = getSupabaseAdmin();
         const { data, error } = await db
@@ -17,18 +25,25 @@ export async function GET(req: NextRequest) {
 
         if (error) throw error;
         return NextResponse.json({ data });
-    } catch (err: any) {
-        return NextResponse.json({ error: err.message }, { status: 500 });
+    } catch (err) {
+        return serverError(err, "agents:GET");
     }
 }
 
 // ── POST /api/agents ───────────────────────────────────────
 export async function POST(req: NextRequest) {
     try {
+        const result = await authenticateRequest("agents:POST");
+        if ("error" in result) return result.error;
+        const { auth } = result;
+
         const body: AgentCreate = await req.json();
         if (!body.organization_id || !body.name) {
-            return NextResponse.json({ error: "organization_id and name required" }, { status: 400 });
+            return apiError("organization_id and name required", 400, "MISSING_FIELDS");
         }
+
+        const orgCheck = verifyOrgAccess(auth, body.organization_id);
+        if (orgCheck) return orgCheck;
 
         const db = getSupabaseAdmin();
         const { data, error } = await db
@@ -49,7 +64,7 @@ export async function POST(req: NextRequest) {
 
         if (error) throw error;
         return NextResponse.json({ data }, { status: 201 });
-    } catch (err: any) {
-        return NextResponse.json({ error: err.message }, { status: 500 });
+    } catch (err) {
+        return serverError(err, "agents:POST");
     }
 }

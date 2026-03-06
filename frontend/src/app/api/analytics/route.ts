@@ -1,12 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseAdmin } from "@/lib/supabase";
+import { authenticateRequest, verifyOrgAccess, apiError, serverError } from "@/lib/api-auth";
 
 // ── GET /api/analytics?org_id=xxx ─────────────────────────
 export async function GET(req: NextRequest) {
     try {
+        const result = await authenticateRequest("analytics:GET");
+        if ("error" in result) return result.error;
+        const { auth } = result;
+
         const orgId = req.nextUrl.searchParams.get("org_id");
-        if (!orgId)
-            return NextResponse.json({ error: "org_id required" }, { status: 400 });
+        if (!orgId) return apiError("org_id required", 400, "MISSING_PARAM");
+
+        const orgCheck = verifyOrgAccess(auth, orgId);
+        if (orgCheck) return orgCheck;
 
         const db = getSupabaseAdmin();
 
@@ -43,7 +50,6 @@ export async function GET(req: NextRequest) {
         // ── KPI Calculations ───────────────────────────────────
         const totalLeads = allLeads.length;
 
-        // Citas Agendadas = leads in stages whose name contains "visita", "cita", "agendad", "reuni"
         const appointmentKeywords = ["visita", "cita", "agendad", "reuni", "appointment"];
         const appointmentStageIds = new Set(
             allStages
@@ -56,14 +62,12 @@ export async function GET(req: NextRequest) {
             appointmentStageIds.has(l.stage_id)
         ).length;
 
-        // Last stage = highest position = "successful" stage (Completado, Cerrado, Entregado…)
         const lastStage = allStages.length > 0 ? allStages[allStages.length - 1] : null;
         const successfulLeads = lastStage
             ? allLeads.filter((l) => l.stage_id === lastStage.id).length
             : 0;
         const lastStageName = lastStage?.name ?? "Etapa final";
 
-        // Discarded stage ids
         const discardedStageIds = new Set(
             allStages
                 .filter((s) =>
@@ -77,17 +81,14 @@ export async function GET(req: NextRequest) {
             discardedStageIds.has(l.stage_id)
         ).length;
 
-        // Conversion rate = citas / total
         const conversionRate =
             totalLeads > 0
                 ? Math.round((citasAgendadas / totalLeads) * 100 * 10) / 10
                 : 0;
 
-        // Time saved (est. 15 min per automated lead)
         const timeSavedMinutes = allLeads.length * 15;
         const timeSavedHours = Math.round((timeSavedMinutes / 60) * 10) / 10;
 
-        // Leads by stage (for charts)
         const leadsByStage = allStages.map((stage) => ({
             stage_id: stage.id,
             stage_name: stage.name,
@@ -95,7 +96,6 @@ export async function GET(req: NextRequest) {
             count: allLeads.filter((l) => l.stage_id === stage.id).length,
         }));
 
-        // Leads by source
         const sourceMap: Record<string, number> = {};
         allLeads.forEach((l) => {
             const src = l.source || "manual";
@@ -121,8 +121,7 @@ export async function GET(req: NextRequest) {
                 leadsBySource,
             },
         });
-    } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : "Unknown error";
-        return NextResponse.json({ error: message }, { status: 500 });
+    } catch (err) {
+        return serverError(err, "analytics:GET");
     }
 }
