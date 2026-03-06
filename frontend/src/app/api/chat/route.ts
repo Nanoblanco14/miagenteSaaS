@@ -1,7 +1,10 @@
+// ═══════════════════════════════════════════════════════════════
+// ⚠️ LEGACY — Webhook simple de Twilio (single-tenant).
+// Para multi-tenant usar: /api/webhook/[tenantId]
+// ═══════════════════════════════════════════════════════════════
 import { createClient } from '@supabase/supabase-js';
 import OpenAI from 'openai';
 
-// 1. Clientes de BD y de IA
 const supabase = createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
@@ -17,14 +20,17 @@ export async function POST(req: Request) {
         const incomingMsg = formData.get('Body')?.toString() || '';
         const sender = formData.get('From')?.toString() || '';
 
-        console.log(`📩 WhatsApp de ${sender}: ${incomingMsg}`);
+        const orgId = process.env.DEFAULT_ORG_ID;
+        if (!orgId) {
+            console.error("DEFAULT_ORG_ID no configurado en variables de entorno");
+            return new Response("Config error", { status: 500 });
+        }
 
-        // ==========================================
-        // 🤖 2. EL CEREBRO DE LA IA (EL PROMPT)
-        // ==========================================
+        console.log(`[chat] WhatsApp de ${sender}: ${incomingMsg}`);
+
         const systemPrompt = `
       Eres el asistente virtual estrella de una inmobiliaria. Tu objetivo es pre-calificar a los clientes que llegan por WhatsApp.
-      
+
       Reglas estrictas:
       1. Tus respuestas deben ser MUY breves (máximo 2 párrafos cortos). Recuerda que estás en WhatsApp.
       2. Sé amable, profesional y persuasivo.
@@ -34,28 +40,19 @@ export async function POST(req: Request) {
       6. NUNCA inventes precios exactos ni nombres de propiedades específicas.
     `;
 
-        // 3. Llamada a OpenAI (Usamos gpt-4o-mini porque es rapidísimo y barato)
         const completion = await openai.chat.completions.create({
             model: "gpt-4o-mini",
             messages: [
                 { role: "system", content: systemPrompt },
-                { role: "user", content: incomingMsg } // Lo que escribió el cliente
+                { role: "user", content: incomingMsg }
             ],
         });
 
         const botResponse = completion.choices[0].message.content || "Lo siento, estoy teniendo problemas técnicos.";
 
-        // ==========================================
-        // 📊 4. LÓGICA DE NEGOCIO (CRM)
-        // ==========================================
-        // TRUCO: Si la IA decidió entregar el link de Calendly en su respuesta, 
-        // significa que el cliente pasó el filtro. ¡Ahí lo guardamos en el Pipeline!
-
         const saveLead = botResponse.includes('calendly.com');
 
         if (saveLead) {
-            const orgId = '2f02b760-63fc-4dba-a587-92e550c1d846'; // <-- ¡NO OLVIDES CAMBIAR ESTO!
-
             const { data: stages } = await supabase.from('pipeline_stages')
                 .select('id').eq('organization_id', orgId).limit(1);
             const stageId = stages?.[0]?.id;
@@ -67,10 +64,9 @@ export async function POST(req: Request) {
                 notes: `Último mensaje: ${incomingMsg}`,
                 stage_id: stageId
             });
-            console.log("✅ ¡Cliente calificado y guardado en el CRM!");
+            console.log("[chat] Cliente calificado y guardado en el CRM");
         }
 
-        // 5. Enviar la respuesta inteligente a Twilio/WhatsApp
         const xmlResponse = `
     <?xml version="1.0" encoding="UTF-8"?>
     <Response>
@@ -83,7 +79,7 @@ export async function POST(req: Request) {
         });
 
     } catch (error) {
-        console.error("Error en el servidor:", error);
+        console.error("[chat] Error en el servidor:", error);
         return new Response("Error", { status: 500 });
     }
 }

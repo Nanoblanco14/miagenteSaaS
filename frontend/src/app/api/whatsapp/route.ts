@@ -1,7 +1,6 @@
 // ═══════════════════════════════════════════════════════════════
-// ⚠️ DEPRECATED — This webhook is hardcoded to a single tenant.
-// Use the new multi-tenant route: /api/webhook/[tenantId]
-// This file is kept for backwards compatibility only.
+// ⚠️ LEGACY — Webhook de Twilio/WhatsApp (single-tenant).
+// Para multi-tenant usar: /api/webhook/[tenantId]
 // ═══════════════════════════════════════════════════════════════
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
@@ -14,6 +13,9 @@ const supabase = createClient(
 );
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// ── Org ID desde variable de entorno (antes era hardcodeado) ─
+const ORG_ID = process.env.DEFAULT_ORG_ID!;
 
 // ── Memoria a corto plazo (por número de teléfono) ──────────
 const chatMemory = new Map<string, ChatCompletionMessageParam[]>();
@@ -177,7 +179,7 @@ export async function POST(req: Request) {
         else liveChatStatus = "Filtrando perfil";
 
         // SELECT first — only update if exists, insert ONLY on first message
-        const orgIdForStatus = "2f02b760-63fc-4dba-a587-92e550c1d846"; // TODO: multi-tenant
+        const orgIdForStatus = ORG_ID;
         const { data: existingForStatus } = await supabase
             .from("leads")
             .select("id")
@@ -248,7 +250,7 @@ export async function POST(req: Request) {
                     console.log(`🔧 Tool call: ${estado_filtro} — ${nombre_cliente}`);
 
                     // ── Procesar en Supabase ────────────────
-                    const orgId = "2f02b760-63fc-4dba-a587-92e550c1d846"; // TODO: resolver por número de WhatsApp en multi-tenant
+                    const orgId = ORG_ID;
 
                     // Buscar el stage destino según el estado
                     let targetStageName = "";
