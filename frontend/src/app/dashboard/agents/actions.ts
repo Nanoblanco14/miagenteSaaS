@@ -1,71 +1,143 @@
 "use server";
 import { getSupabaseAdmin } from "@/lib/supabase";
 
+// Allow up to 60 s of execution time for this Server Action route
+
+
+const JINA_TIMEOUT_MS = 45_000;          // 45 s — páginas pesadas necesitan tiempo
+const MAX_CHARS_PER_URL = 6_000;
+const MAX_TOTAL_CHARS = 12_000;
+
 /**
- * Scrapes plain text from a URL and saves it to agents.scraped_context.
- * No extra dependencies — strips HTML with a regex.
+ * Fetches one URL via Jina AI reader (https://r.jina.ai/<url>)
+ * which returns clean Markdown — no nav, footer, scripts, ads.
  */
-export async function scrapeAndSaveUrl(
-    agentId: string,
-    url: string
-): Promise<{ ok: boolean; preview?: string; error?: string }> {
-    if (!agentId || !url) {
-        return { ok: false, error: "Faltan parámetros" };
-    }
-
-    let rawHtml: string;
+async function fetchViaJina(url: string): Promise<{ ok: boolean; text?: string; error?: string }> {
     try {
-        const res = await fetch(url, {
+        const jinaUrl = `https://r.jina.ai/${url}`;
+        const res = await fetch(jinaUrl, {
             headers: {
-                "User-Agent":
-                    "Mozilla/5.0 (compatible; KnowledgeBot/1.0; +https://antigravity.google)",
-                Accept: "text/html,application/xhtml+xml",
+                "Accept": "text/plain, text/markdown",
+                "User-Agent": "KnowledgeBot/2.0",
+                // Jina respects X-Return-Format: markdown (optional, already default)
+                "X-Return-Format": "markdown",
             },
-            signal: AbortSignal.timeout(10_000),
+            signal: AbortSignal.timeout(JINA_TIMEOUT_MS),
         });
+
         if (!res.ok) {
-            return { ok: false, error: `HTTP ${res.status} al acceder a la URL` };
+            return {
+                ok: false,
+                error: `No se pudo acceder a ${url} (código HTTP ${res.status}). Verifica que la URL sea pública y correcta.`,
+            };
         }
-        rawHtml = await res.text();
+
+        let text = await res.text();
+
+        // Trim Jina metadata header (first line is usually "URL: …")
+        text = text.replace(/^(URL|Title|Source):[^\n]*\n/gim, "").trim();
+
+        if (text.length < 50) {
+            return {
+                ok: false,
+                error: `No se encontró contenido útil en ${url}. La página puede estar protegida o ser dinámica (JavaScript-only).`,
+            };
+        }
+
+        // Per-URL cap — keeps individual pages from dwarfing others
+        if (text.length > MAX_CHARS_PER_URL) {
+            text = text.slice(0, MAX_CHARS_PER_URL) + "\n\n[...contenido truncado...]";
+        }
+
+        return { ok: true, text };
     } catch (err: any) {
-        return { ok: false, error: `No se pudo acceder a la URL: ${err.message}` };
+        const isTimeout =
+            err?.name === "TimeoutError" ||
+            err?.name === "AbortError" ||
+            (err?.message ?? "").toLowerCase().includes("timeout") ||
+            (err?.message ?? "").toLowerCase().includes("aborted");
+
+        if (isTimeout) {
+            return {
+                ok: false,
+                error: `⏱️ ${url} tardó demasiado en responder (más de 45 s). Tip: copia y pega el contenido manualmente en el cuadro de revisión.`,
+            };
+        }
+
+        return {
+            ok: false,
+            error: `Error al acceder a ${url}: ${err?.message ?? "error desconocido"}. Si el problema persiste, pega el contenido manualmente.`,
+        };
+    }
+}
+
+/**
+ * Scrapes multiple URLs via Jina AI and returns the combined Markdown
+ * text for user review. Does NOT write to the database.
+ */
+export async function scrapeUrlsForPreview(
+    urls: string[]
+): Promise<{ ok: boolean; text?: string; errors?: string[] }> {
+    const validUrls = urls.map((u) => u.trim()).filter(Boolean);
+
+    if (validUrls.length === 0) {
+        return { ok: false, errors: ["Debes ingresar al menos una URL."] };
     }
 
-    // ── Strip HTML ────────────────────────────────────────────
-    // Remove <script>, <style>, <head> and all other tags
-    let text = rawHtml
-        .replace(/<script[\s\S]*?<\/script>/gi, " ")
-        .replace(/<style[\s\S]*?<\/style>/gi, " ")
-        .replace(/<head[\s\S]*?<\/head>/gi, " ")
-        .replace(/<[^>]+>/g, " ")          // strip remaining tags
-        .replace(/&nbsp;/gi, " ")
-        .replace(/&amp;/gi, "&")
-        .replace(/&lt;/gi, "<")
-        .replace(/&gt;/gi, ">")
-        .replace(/&quot;/gi, '"')
-        .replace(/&#039;/gi, "'")
-        .replace(/\s+/g, " ")              // collapse whitespace
-        .trim();
+    const results = await Promise.allSettled(validUrls.map(fetchViaJina));
 
-    // Truncate to avoid bloating the system prompt
-    if (text.length > 8000) {
-        text = text.slice(0, 8000) + "\n[...contenido truncado...]";
+    const sections: string[] = [];
+    const errors: string[] = [];
+
+    results.forEach((result, i) => {
+        const url = validUrls[i];
+        if (result.status === "fulfilled" && result.value.ok && result.value.text) {
+            sections.push(`## Fuente: ${url}\n\n${result.value.text}`);
+        } else {
+            const errMsg =
+                result.status === "rejected"
+                    ? result.reason?.message
+                    : result.value.error;
+            errors.push(`⚠️ ${url}: ${errMsg}`);
+            sections.push(`## Fuente: ${url}\n\n_No se pudo extraer contenido de esta URL._`);
+        }
+    });
+
+    let combined = sections.join("\n\n---\n\n");
+
+    // Global cap
+    if (combined.length > MAX_TOTAL_CHARS) {
+        combined = combined.slice(0, MAX_TOTAL_CHARS) + "\n\n[...contexto total truncado a 12 000 caracteres...]";
     }
 
-    if (!text || text.length < 50) {
-        return { ok: false, error: "No se pudo extraer texto útil de esa URL." };
+    if (!combined.trim()) {
+        return { ok: false, errors: errors.length ? errors : ["No se extrajo ningún contenido."] };
     }
 
-    // ── Persist to DB ─────────────────────────────────────────
+    return { ok: true, text: combined, errors: errors.length ? errors : undefined };
+}
+
+/**
+ * Persists the (possibly user-edited) text to agents.scraped_context.
+ * Called only after the user reviews and approves the content.
+ */
+export async function saveScrapedContext(
+    agentId: string,
+    text: string
+): Promise<{ ok: boolean; error?: string }> {
+    if (!agentId || !text?.trim()) {
+        return { ok: false, error: "Faltan parámetros." };
+    }
+
     const db = getSupabaseAdmin();
     const { error: dbErr } = await db
         .from("agents")
-        .update({ scraped_context: text })
+        .update({ scraped_context: text.trim() })
         .eq("id", agentId);
 
     if (dbErr) {
         return { ok: false, error: `Error al guardar: ${dbErr.message}` };
     }
 
-    return { ok: true, preview: text.slice(0, 240) };
+    return { ok: true };
 }

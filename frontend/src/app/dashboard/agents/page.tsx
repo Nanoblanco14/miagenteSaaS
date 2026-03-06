@@ -3,13 +3,13 @@ import React, { useEffect, useState, useCallback } from "react";
 import { useOrg } from "@/lib/org-context";
 import { INDUSTRY_TEMPLATES } from "@/lib/industry-templates";
 import { applyIndustryTemplate } from "../settings/actions";
-import { scrapeAndSaveUrl } from "./actions";
+import { scrapeUrlsForPreview, saveScrapedContext } from "./actions";
 import type { ConversationTone } from "@/lib/types";
 import {
     Bot, Save, Sparkles, CheckCircle, CalendarCheck,
     MessageSquare, SlidersHorizontal, AlertTriangle, Kanban, Loader2, Check,
     Scissors, Building2, ShoppingBag, FileText, Briefcase, Rocket, Smile,
-    Globe, RefreshCw, BookOpen,
+    Globe, RefreshCw, BookOpen, Plus, Trash2, Database,
 } from "lucide-react";
 
 const TEMPLATE_ICONS: Record<string, React.ReactNode> = {
@@ -91,9 +91,12 @@ export default function AgentConfigPage() {
     const [tplResult, setTplResult] = useState<{ stagesCreated: boolean; msg: string } | null>(null);
 
     // ── URL Brain state ───────────────────────────────────────
-    const [scrapeUrl, setScrapeUrl] = useState("");
+    const [urls, setUrls] = useState<string[]>([""]);  // multi-URL list
     const [scraping, setScraping] = useState(false);
-    const [scrapeResult, setScrapeResult] = useState<{ ok: boolean; preview?: string; error?: string } | null>(null);
+    const [scrapeErrors, setScrapeErrors] = useState<string[]>([]);
+    const [extractedText, setExtractedText] = useState<string | null>(null); // review buffer
+    const [contextSaving, setContextSaving] = useState(false);
+    const [contextSaved, setContextSaved] = useState(false);
     const [currentContext, setCurrentContext] = useState<string | null>(null);
 
     const loadAgent = useCallback(async () => {
@@ -161,16 +164,40 @@ export default function AgentConfigPage() {
         setSaving(false);
     };
 
+    // ── URL Brain handlers ────────────────────────────────────
+    const addUrl = () => setUrls((prev) => [...prev, ""]);
+    const removeUrl = (i: number) => setUrls((prev) => prev.filter((_, idx) => idx !== i));
+    const updateUrl = (i: number, val: string) =>
+        setUrls((prev) => prev.map((u, idx) => (idx === i ? val : u)));
+
     const handleScrape = async () => {
-        if (!agent || !scrapeUrl.trim()) return;
-        setScraping(true); setScrapeResult(null);
-        const result = await scrapeAndSaveUrl(agent.id, scrapeUrl.trim());
-        setScrapeResult(result);
-        if (result.ok) {
-            setCurrentContext(result.preview ?? null);
-            setScrapeUrl("");
+        if (!agent) return;
+        setScraping(true); setScrapeErrors([]); setExtractedText(null); setContextSaved(false);
+        const result = await scrapeUrlsForPreview(urls);
+        if (result.ok && result.text) {
+            setExtractedText(result.text);
+        }
+        if (result.errors?.length) {
+            setScrapeErrors(result.errors);
+        }
+        if (!result.ok && !result.text) {
+            setScrapeErrors(result.errors ?? ["Error desconocido al extraer contenido."]);
         }
         setScraping(false);
+    };
+
+    const handleSaveContext = async () => {
+        if (!agent || !extractedText?.trim()) return;
+        setContextSaving(true); setContextSaved(false);
+        const result = await saveScrapedContext(agent.id, extractedText);
+        if (result.ok) {
+            setCurrentContext(extractedText);
+            setContextSaved(true);
+            setTimeout(() => setContextSaved(false), 3000);
+        } else {
+            setScrapeErrors([result.error ?? "Error al guardar."]);
+        }
+        setContextSaving(false);
     };
 
     if (loading) {
@@ -351,57 +378,149 @@ export default function AgentConfigPage() {
                 <SectionCard
                     icon={<BookOpen size={17} />}
                     title="Entrenar con URL (Base de Conocimiento)"
-                    subtitle="Extrae texto de tu web y entrena al bot con la información de tu empresa"
+                    subtitle="Extrae contenido de una o varias páginas de tu web y revísalo antes de guardar"
                 >
                     <div className="space-y-4">
-                        {/* Input row */}
-                        <div style={{ display: "flex", gap: "10px" }}>
-                            <div style={{ position: "relative", flex: 1 }}>
-                                <Globe size={15} style={{
-                                    position: "absolute", left: "14px", top: "50%",
-                                    transform: "translateY(-50%)", color: "var(--text-muted)",
-                                    pointerEvents: "none",
-                                }} />
-                                <input
-                                    className="input"
-                                    style={{ paddingLeft: "40px" }}
-                                    value={scrapeUrl}
-                                    onChange={e => setScrapeUrl(e.target.value)}
-                                    onKeyDown={e => e.key === "Enter" && handleScrape()}
-                                    placeholder="https://tuempresa.com/sobre-nosotros"
-                                    disabled={scraping}
-                                />
-                            </div>
+
+                        {/* ── URL list ── */}
+                        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                            {urls.map((url, i) => (
+                                <div key={i} style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                                    <div style={{ position: "relative", flex: 1 }}>
+                                        <Globe size={14} style={{
+                                            position: "absolute", left: "12px", top: "50%",
+                                            transform: "translateY(-50%)", color: "var(--text-muted)",
+                                            pointerEvents: "none",
+                                        }} />
+                                        <input
+                                            className="input"
+                                            style={{ paddingLeft: "36px" }}
+                                            value={url}
+                                            onChange={(e) => updateUrl(i, e.target.value)}
+                                            onKeyDown={(e) => e.key === "Enter" && i === urls.length - 1 && addUrl()}
+                                            placeholder={i === 0 ? "https://tuempresa.com/inicio" : "https://tuempresa.com/faq"}
+                                            disabled={scraping}
+                                        />
+                                    </div>
+                                    {urls.length > 1 && (
+                                        <button
+                                            type="button"
+                                            onClick={() => removeUrl(i)}
+                                            disabled={scraping}
+                                            title="Eliminar esta URL"
+                                            style={{
+                                                background: "rgba(239,68,68,0.08)",
+                                                border: "1px solid rgba(239,68,68,0.2)",
+                                                borderRadius: "8px", color: "#f87171",
+                                                padding: "8px", cursor: "pointer",
+                                                display: "flex", alignItems: "center",
+                                                transition: "all 0.15s ease", flexShrink: 0,
+                                            }}
+                                        >
+                                            <Trash2 size={14} />
+                                        </button>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+
+                        {/* ── Add URL + Extract buttons ── */}
+                        <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+                            <button
+                                type="button"
+                                onClick={addUrl}
+                                disabled={scraping}
+                                style={{
+                                    display: "flex", alignItems: "center", gap: "6px",
+                                    padding: "9px 14px", borderRadius: "9px", fontSize: "0.8rem",
+                                    background: "rgba(255,255,255,0.03)",
+                                    border: "1px solid rgba(255,255,255,0.08)",
+                                    color: "var(--text-secondary)", cursor: "pointer",
+                                    transition: "all 0.15s ease",
+                                }}
+                            >
+                                <Plus size={14} /> Agregar otra URL
+                            </button>
+
                             <button
                                 className="btn-primary"
                                 onClick={handleScrape}
-                                disabled={scraping || !scrapeUrl.trim()}
-                                style={{ minWidth: "160px", justifyContent: "center" }}
+                                disabled={scraping || urls.every((u) => !u.trim())}
+                                style={{ flex: 1, justifyContent: "center", minWidth: "160px" }}
                             >
                                 {scraping
-                                    ? <><Loader2 size={14} className="animate-spin" /> Extrayendo…</>
-                                    : <><RefreshCw size={14} /> Extraer Información</>
-                                }
+                                    ? <><Loader2 size={14} className="animate-spin" /> Extrayendo con Jina AI…</>
+                                    : <><RefreshCw size={14} /> Extraer Información</>}
                             </button>
                         </div>
 
-                        {/* Result banner */}
-                        {scrapeResult && (
+                        {/* ── Partial error warnings ── */}
+                        {scrapeErrors.length > 0 && (
                             <div style={{
-                                padding: "12px 14px", borderRadius: "10px", fontSize: "0.8rem",
-                                background: scrapeResult.ok ? "rgba(16,185,129,0.08)" : "rgba(239,68,68,0.08)",
-                                border: scrapeResult.ok ? "1px solid rgba(16,185,129,0.25)" : "1px solid rgba(239,68,68,0.25)",
-                                color: scrapeResult.ok ? "#34d399" : "#f87171",
+                                padding: "10px 14px", borderRadius: "10px", fontSize: "0.78rem",
+                                background: "rgba(239,68,68,0.07)",
+                                border: "1px solid rgba(239,68,68,0.2)",
+                                color: "#f87171", display: "flex", flexDirection: "column", gap: "4px",
                             }}>
-                                {scrapeResult.ok
-                                    ? <><Check size={13} className="inline mr-1.5" />Información guardada correctamente</>
-                                    : scrapeResult.error
-                                }
+                                {scrapeErrors.map((e, i) => <span key={i}>{e}</span>)}
                             </div>
                         )}
 
-                        {/* Current context preview */}
-                        {currentContext && (
+                        {/* ── Review textarea ── */}
+                        {extractedText !== null && (
+                            <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                                <div style={{
+                                    display: "flex", alignItems: "center", gap: "6px",
+                                    fontSize: "0.68rem", fontWeight: 700,
+                                    textTransform: "uppercase", letterSpacing: "0.07em",
+                                    color: "var(--text-muted)",
+                                }}>
+                                    <BookOpen size={11} />
+                                    Revisa y corrige el contenido extraído
+                                </div>
+                                <textarea
+                                    className="textarea"
+                                    value={extractedText}
+                                    onChange={(e) => { setExtractedText(e.target.value); setContextSaved(false); }}
+                                    style={{
+                                        minHeight: "280px",
+                                        fontFamily: "monospace",
+                                        fontSize: "0.78rem",
+                                        lineHeight: 1.75,
+                                        resize: "vertical",
+                                    }}
+                                />
+                                <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+                                    Puedes editar, corregir o agregar información antes de guardar.
+                                    Solo el texto de este cuadro se guardará en la base de conocimiento.
+                                </p>
+
+                                {/* Save button */}
+                                <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                                    <button
+                                        className="btn-primary"
+                                        onClick={handleSaveContext}
+                                        disabled={contextSaving || !extractedText.trim()}
+                                        style={{
+                                            display: "flex", alignItems: "center", gap: "7px",
+                                            minWidth: "240px", justifyContent: "center",
+                                            ...(contextSaved
+                                                ? { background: "rgba(34,197,94,0.12)", color: "var(--success)", border: "1px solid rgba(34,197,94,0.2)" }
+                                                : {}),
+                                        }}
+                                    >
+                                        {contextSaving
+                                            ? <><Loader2 size={13} className="animate-spin" /> Guardando…</>
+                                            : contextSaved
+                                                ? <><Check size={13} /> ¡Guardado en la Base de Conocimiento!</>
+                                                : <><Database size={13} /> Guardar en la Base de Conocimiento</>}
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* ── Current context preview ── */}
+                        {currentContext && extractedText === null && (
                             <div>
                                 <div style={{
                                     display: "flex", alignItems: "center", gap: "6px",
@@ -418,11 +537,11 @@ export default function AgentConfigPage() {
                                     border: "1px solid rgba(255,255,255,0.06)",
                                     fontSize: "0.75rem", lineHeight: 1.7,
                                     color: "var(--text-secondary)",
-                                    maxHeight: "120px", overflowY: "auto",
+                                    maxHeight: "130px", overflowY: "auto",
                                     fontFamily: "monospace",
                                 }}>
-                                    {currentContext.slice(0, 400)}
-                                    {currentContext.length > 400 && <span style={{ color: "var(--text-muted)" }}> …</span>}
+                                    {currentContext.slice(0, 500)}
+                                    {currentContext.length > 500 && <span style={{ color: "var(--text-muted)" }}> …</span>}
                                 </div>
                                 <p className="text-xs mt-2" style={{ color: "var(--text-muted)" }}>
                                     Este texto se inyecta automáticamente en el prompt del bot en cada conversación.
@@ -430,9 +549,10 @@ export default function AgentConfigPage() {
                             </div>
                         )}
 
-                        {!currentContext && !scrapeResult && (
+                        {!currentContext && extractedText === null && !scraping && (
                             <p className="text-xs" style={{ color: "var(--text-muted)" }}>
-                                Ingresa la URL de tu web (sobre nosotros, servicios, FAQ…) y el bot aprenderá esa información para usarla en conversaciones.
+                                Ingresa una o más URLs (inicio, servicios, FAQ…), extrae la información,
+                                revísala y guárdala para que el bot aprenda sobre tu empresa.
                             </p>
                         )}
                     </div>

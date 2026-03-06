@@ -13,9 +13,6 @@ const supabaseAdmin = createClient(
     { auth: { autoRefreshToken: false, persistSession: false } }
 );
 
-// ── In-memory chat history (per phone number) ───────────────
-const chatMemory = new Map<string, ChatCompletionMessageParam[]>();
-
 // ═══════════════════════════════════════════════════════════════
 //  🔧 TOOL DEFINITION — gestionar_lead_crm
 // ═══════════════════════════════════════════════════════════════
@@ -257,6 +254,7 @@ Si un cliente pide cambiar la fecha u hora de una cita ya agendada, esto es un i
 Esta regla es INQUEBRANTABLE para TODAS las plantillas de industria.`;
 }
 
+void isAppointmentCriticalIndustry; // imported for potential future use in prompt logic
 
 // ═══════════════════════════════════════════════════════════════
 //  📨 MESSAGE PARSERS — Extract message/sender per provider
@@ -360,7 +358,6 @@ function sanitizeMessageHistory(
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const msg = { ...m } as any;
         if (msg.role === "assistant" && msg.tool_calls) {
-            // top-level tool_calls might be a JSON string from the DB
             if (typeof msg.tool_calls === "string") {
                 try {
                     msg.tool_calls = JSON.parse(msg.tool_calls);
@@ -372,11 +369,9 @@ function sanitizeMessageHistory(
                 msg.tool_calls = msg.tool_calls
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any
                     .map((tc: any) => {
-                        // individual tool_call might be a JSON string
                         if (typeof tc === "string") {
                             try { return JSON.parse(tc); } catch { return null; }
                         }
-                        // arguments must be a string for OpenAI — re-serialize if object
                         if (tc && tc.function && typeof tc.function.arguments !== "string") {
                             tc.function.arguments = JSON.stringify(tc.function.arguments);
                         }
@@ -402,8 +397,6 @@ function sanitizeMessageHistory(
     }
 
     // ── Phase 3: Identify assistant messages whose tool_calls are fully responded ──
-    //   If ANY tool_call in an assistant msg has no tool response, strip tool_calls
-    //   from that assistant (avoids OpenAI error in both directions).
     const validToolCallIds = new Set<string>();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const incompleteAssistants = new WeakSet<any>();
@@ -422,35 +415,29 @@ function sanitizeMessageHistory(
                 for (const tc of m.tool_calls) validToolCallIds.add(tc.id);
             } else {
                 incompleteAssistants.add(m);
-                console.warn(
-                    `🧹 Stripping tool_calls from assistant with missing tool responses`
-                );
+                console.warn(`🧹 Stripping tool_calls from assistant with missing tool responses`);
             }
         }
     }
 
-    // ── Phase 4: Build clean history, removing orphaned tool msgs and fixing assistants ──
+    // ── Phase 4: Build clean history, removing orphaned tool msgs ──
     const sanitized: ChatCompletionMessageParam[] = [];
     for (let i = 0; i < parsed.length; i++) {
         const m = parsed[i];
 
-        // Strip tool_calls from assistants that had unmatched calls
         if (incompleteAssistants.has(m)) {
             const { tool_calls: _dropped, ...rest } = m;
             void _dropped;
-            if (rest.content) sanitized.push(rest); // only keep if has text
+            if (rest.content) sanitized.push(rest);
             continue;
         }
 
         if (m.role === "tool") {
             const toolCallId = m.tool_call_id;
             if (!toolCallId || !validToolCallIds.has(toolCallId)) {
-                console.warn(
-                    `🧹 Removing orphaned tool message (tool_call_id: ${toolCallId})`
-                );
+                console.warn(`🧹 Removing orphaned tool message (tool_call_id: ${toolCallId})`);
                 continue;
             }
-            // Verify the assistant with that tool_call actually precedes us in sanitized
             let foundPrecedingAssistant = false;
             for (let j = sanitized.length - 1; j >= 0; j--) {
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -466,9 +453,7 @@ function sanitizeMessageHistory(
                 }
             }
             if (!foundPrecedingAssistant) {
-                console.warn(
-                    `🧹 Removing tool message with no preceding assistant in sanitized (tool_call_id: ${toolCallId})`
-                );
+                console.warn(`🧹 Removing tool message with no preceding assistant (tool_call_id: ${toolCallId})`);
                 continue;
             }
         }
@@ -477,6 +462,37 @@ function sanitizeMessageHistory(
     }
 
     return sanitized as ChatCompletionMessageParam[];
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  📚 LOAD CONVERSATION HISTORY FROM SUPABASE
+//
+//  Replaces the former in-memory `chatMemory` Map.
+//  By reading from `lead_messages` on every request this works
+//  correctly across Vercel serverless cold starts and across
+//  multiple concurrent function instances.
+// ═══════════════════════════════════════════════════════════════
+async function loadConversationHistory(
+    leadId: string,
+    limit = 15
+): Promise<ChatCompletionMessageParam[]> {
+    const { data, error } = await supabaseAdmin
+        .from("lead_messages")
+        .select("role, content")
+        .eq("lead_id", leadId)
+        .order("created_at", { ascending: true })
+        .limit(limit);
+
+    if (error || !data) return [];
+
+    // Only user/assistant turns — tool call rows are ephemeral within a
+    // single request and are not stored in lead_messages.
+    return data
+        .filter((m) => m.role === "user" || m.role === "assistant")
+        .map((m) => ({
+            role: m.role as "user" | "assistant",
+            content: m.content,
+        }));
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -492,6 +508,12 @@ interface TenantConfig {
 
 // ═══════════════════════════════════════════════════════════════
 //  GET handler — Meta Webhook Verification (challenge)
+//
+//  Two-tier verify_token strategy:
+//    1. META_VERIFY_TOKEN env var  →  single global token for all tenants
+//       (simple, set once in Vercel dashboard)
+//    2. Per-tenant token stored in organizations.whatsapp_credentials
+//       (advanced multi-tenant setup)
 // ═══════════════════════════════════════════════════════════════
 export async function GET(
     req: Request,
@@ -503,24 +525,42 @@ export async function GET(
     const token = url.searchParams.get("hub.verify_token");
     const challenge = url.searchParams.get("hub.challenge");
 
-    if (mode === "subscribe" && token && challenge) {
-        // Look up the tenant's verify_token
-        const { data: tenant } = await supabaseAdmin
-            .from("organizations")
-            .select("whatsapp_credentials")
-            .eq("id", tenantId)
-            .single();
+    // Only respond to Meta's subscription verification handshake
+    if (mode !== "subscribe" || !token || !challenge) {
+        return new Response("OK", { status: 200 });
+    }
 
-        if (
-            tenant?.whatsapp_credentials?.verify_token &&
-            tenant.whatsapp_credentials.verify_token === token
-        ) {
+    // ── Option 1: Global env var (META_VERIFY_TOKEN) ──────────
+    const globalToken = process.env.META_VERIFY_TOKEN;
+    if (globalToken) {
+        if (token === globalToken) {
+            console.log(`✅ Webhook verified via META_VERIFY_TOKEN [tenant: ${tenantId}]`);
             return new Response(challenge, { status: 200 });
         }
+        console.warn(`🚫 Webhook verification failed — token mismatch [tenant: ${tenantId}]`);
         return new Response("Forbidden", { status: 403 });
     }
 
-    return new Response("OK", { status: 200 });
+    // ── Option 2: Per-tenant token stored in Supabase ─────────
+    const { data: org, error } = await supabaseAdmin
+        .from("organizations")
+        .select("whatsapp_credentials")
+        .eq("id", tenantId)
+        .single();
+
+    if (error || !org) {
+        console.warn(`🚫 Webhook verification — tenant not found [${tenantId}]`);
+        return new Response("Forbidden", { status: 403 });
+    }
+
+    const storedToken = org?.whatsapp_credentials?.verify_token;
+    if (storedToken && storedToken === token) {
+        console.log(`✅ Webhook verified via per-tenant token [tenant: ${tenantId}]`);
+        return new Response(challenge, { status: 200 });
+    }
+
+    console.warn(`🚫 Webhook verification failed — token mismatch [tenant: ${tenantId}]`);
+    return new Response("Forbidden", { status: 403 });
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -555,9 +595,7 @@ export async function POST(
         if (!t.openai_api_key) {
             console.error(`❌ Tenant ${t.name} has no OpenAI API key`);
             return new Response(
-                JSON.stringify({
-                    error: "Tenant has no OpenAI API key configured",
-                }),
+                JSON.stringify({ error: "Tenant has no OpenAI API key configured" }),
                 { status: 400 }
             );
         }
@@ -580,11 +618,9 @@ export async function POST(
         }
 
         const { body: incomingMsg, sender, phoneClean } = parsed;
-        console.log(
-            `📩 [${t.name}] WhatsApp de ${sender}: ${incomingMsg}`
-        );
+        console.log(`📩 [${t.name}] WhatsApp de ${sender}: ${incomingMsg}`);
 
-        // ── 3. Load agent's system prompt ─────────────────────
+        // ── 3. Load agent config ──────────────────────────────
         const { data: agent } = await supabaseAdmin
             .from("agents")
             .select("system_prompt, booking_url, conversation_tone, escalation_rule")
@@ -597,28 +633,12 @@ export async function POST(
             agent?.system_prompt ||
             "Eres un asistente de ventas profesional. Filtra prospectos haciendo preguntas clave sobre qué buscan, su presupuesto y zona de interés.";
 
-        // Inject booking URL if available
         let fullPrompt = basePrompt;
         if (agent?.booking_url) {
             fullPrompt += `\n\n═══ ENLACE DE AGENDAMIENTO ═══\nCuando el prospecto califique, entrégale este link para agendar: ${agent.booking_url}`;
         }
 
-        // ── 4. Chat memory ────────────────────────────────────
-        const memoryKey = `${tenantId}:${sender}`;
-        if (!chatMemory.has(memoryKey)) {
-            chatMemory.set(memoryKey, []);
-        }
-        const history = chatMemory.get(memoryKey)!;
-        history.push({ role: "user", content: incomingMsg });
-
-        // ── 4b. Live tracking status ──────────────────────────
-        const msgCount = history.filter((m) => m.role === "user").length;
-        let liveChatStatus = "Contacto inicial";
-        if (msgCount === 1) liveChatStatus = "Contacto inicial";
-        else if (msgCount <= 3) liveChatStatus = "Consultando opciones";
-        else liveChatStatus = "Filtrando perfil";
-
-        // Upsert live status
+        // ── 4. Find or create lead; check bot-paused state ────
         const { data: existingForStatus } = await supabaseAdmin
             .from("leads")
             .select("id, is_bot_paused")
@@ -626,26 +646,20 @@ export async function POST(
             .eq("phone", phoneClean)
             .limit(1);
 
-        const leadAlreadyExists =
-            existingForStatus && existingForStatus.length > 0;
+        const leadAlreadyExists = existingForStatus && existingForStatus.length > 0;
 
-        // ── 4b-1. HUMAN TAKEOVER — early exit if bot is paused ─
+        // ── 4a. Human takeover — early exit if bot is paused ──
         if (leadAlreadyExists && existingForStatus[0].is_bot_paused) {
             console.log(`⏸️ [${t.name}] Bot pausado para ${phoneClean}. Mensaje ignorado.`);
             if (t.whatsapp_provider === "twilio") {
-                return buildTwilioResponse(""); // TwiML empty response, no message sent
+                return buildTwilioResponse("");
             }
             return new Response("OK", { status: 200 });
         }
 
-        if (leadAlreadyExists) {
-            // Lead ya existe → solo actualizar el chat_status, nunca duplicar
-            await supabaseAdmin
-                .from("leads")
-                .update({ chat_status: liveChatStatus })
-                .eq("id", existingForStatus[0].id);
-        } else {
-            // Lead nuevo → insertar solo si verdaderamente no existe en la BD
+        if (!leadAlreadyExists) {
+            // First contact — create lead with default initial status.
+            // chat_status will be recalculated and updated after history is loaded.
             const { data: firstStage } = await supabaseAdmin
                 .from("pipeline_stages")
                 .select("id")
@@ -659,16 +673,15 @@ export async function POST(
                 name: "Lead WhatsApp",
                 phone: phoneClean,
                 source: "whatsapp",
-                chat_status: liveChatStatus,
+                chat_status: "Contacto inicial",
             });
         }
 
-        // ── Resolve leadId for message persistence ────────────
+        // ── 4b. Resolve leadId ────────────────────────────────
         let leadId: string | null = null;
         if (leadAlreadyExists) {
             leadId = existingForStatus[0].id;
         } else {
-            // Fetch the just-inserted row
             const { data: newLeadRow } = await supabaseAdmin
                 .from("leads")
                 .select("id")
@@ -679,7 +692,7 @@ export async function POST(
             leadId = newLeadRow?.id ?? null;
         }
 
-        // ── Save incoming user message ────────────────────────
+        // ── 4c. Persist the incoming user message ─────────────
         if (leadId) {
             await supabaseAdmin.from("lead_messages").insert({
                 lead_id: leadId,
@@ -688,7 +701,31 @@ export async function POST(
             });
         }
 
-        // ── 4c. Fetch real pipeline stages for this tenant ────
+        // ── 4d. Load full conversation history from Supabase ──
+        // The last 15 rows include the message just saved above,
+        // so dbHistory ends with the current user message — ready
+        // to be passed directly to OpenAI without any extra push.
+        const dbHistory: ChatCompletionMessageParam[] = leadId
+            ? await loadConversationHistory(leadId, 15)
+            : [{ role: "user", content: incomingMsg }];
+
+        // ── 4e. Compute and persist live chat status ──────────
+        const userMsgCount = dbHistory.filter((m) => m.role === "user").length;
+        const liveChatStatus =
+            userMsgCount <= 1
+                ? "Contacto inicial"
+                : userMsgCount <= 3
+                    ? "Consultando opciones"
+                    : "Filtrando perfil";
+
+        if (leadId) {
+            await supabaseAdmin
+                .from("leads")
+                .update({ chat_status: liveChatStatus })
+                .eq("id", leadId);
+        }
+
+        // ── 5. Fetch pipeline stages + catalog + knowledge ────
         const { data: stageDocs } = await supabaseAdmin
             .from("pipeline_stages")
             .select("name")
@@ -698,7 +735,6 @@ export async function POST(
             (s: { name: string }) => s.name
         );
 
-        // ── 5. Fetch catalog & company knowledge for this tenant ──
         const [{ data: catalogItems }, { data: agentWithContext }] = await Promise.all([
             supabaseAdmin
                 .from("products")
@@ -714,9 +750,6 @@ export async function POST(
                 .maybeSingle(),
         ]);
 
-        // Format catalog as concise text
-        // If catalog is empty we inject an explicit sentinel so the AI KNOWS
-        // it has nothing to offer and cannot hallucinate products.
         let catalogText: string;
         if (!catalogItems || catalogItems.length === 0) {
             catalogText =
@@ -735,7 +768,7 @@ export async function POST(
 
         const scrapedContext: string | null = agentWithContext?.scraped_context ?? null;
 
-        // ── 6. Call OpenAI with tenant's own API key ──────────
+        // ── 6. Build system prompt and call OpenAI ────────────
         const tenantOpenai = new OpenAI({ apiKey: t.openai_api_key });
         const industryId: string | null = (tenant as any)?.settings?.industry_template ?? null;
         const systemPrompt = buildSystemPrompt(
@@ -748,24 +781,29 @@ export async function POST(
             industryId
         );
 
-        const sanitizedHistory = sanitizeMessageHistory(history);
+        // `currentTurnMessages` is the ephemeral working array for this
+        // single request. It starts with the persisted DB history and
+        // grows with tool_call / tool-response pairs that are NOT saved
+        // to Supabase — only the final assistant text response is persisted.
+        const currentTurnMessages: ChatCompletionMessageParam[] = [...dbHistory];
+
         const completion = await tenantOpenai.chat.completions.create({
             model: "gpt-4o-mini",
             messages: [
                 { role: "system", content: systemPrompt },
-                ...sanitizedHistory,
+                ...sanitizeMessageHistory(currentTurnMessages),
             ],
             tools,
             tool_choice: "auto",
         });
 
-        const choice = completion.choices[0];
-        const assistantMsg = choice.message;
+        const assistantMsg = completion.choices[0].message;
         let botResponse = assistantMsg.content || "";
 
-        // ── 6. Handle tool calls ──────────────────────────────
+        // ── 7. Handle tool calls ──────────────────────────────
         if (assistantMsg.tool_calls && assistantMsg.tool_calls.length > 0) {
-            history.push(assistantMsg);
+            // Append the assistant turn (with tool_calls) to the ephemeral array
+            currentTurnMessages.push(assistantMsg);
 
             for (const toolCall of assistantMsg.tool_calls) {
                 if (toolCall.type !== "function") continue;
@@ -778,9 +816,7 @@ export async function POST(
                         resumen_conversacion,
                     } = args;
 
-                    console.log(
-                        `🔧 [${t.name}] Tool call: ${estado_filtro} — ${nombre_cliente}`
-                    );
+                    console.log(`🔧 [${t.name}] Tool call: ${estado_filtro} — ${nombre_cliente}`);
 
                     // Find target stage
                     let targetStageName = "";
@@ -816,7 +852,7 @@ export async function POST(
                         }
                     }
 
-                    // Upsert lead
+                    // Upsert lead with CRM data
                     const { data: existingLeads } = await supabaseAdmin
                         .from("leads")
                         .select("id")
@@ -826,9 +862,7 @@ export async function POST(
 
                     const finalChatStatus =
                         estado_filtro === "Calificado"
-                            ? fecha_hora_cita
-                                ? "Cita agendada"
-                                : "Negociando horario"
+                            ? fecha_hora_cita ? "Cita agendada" : "Negociando horario"
                             : estado_filtro === "Derivado a Humano"
                                 ? "Derivado a humano"
                                 : "Descartado";
@@ -842,10 +876,7 @@ export async function POST(
                         chat_status: finalChatStatus,
                     };
 
-                    if (
-                        estado_filtro === "Calificado" &&
-                        fecha_hora_cita
-                    ) {
+                    if (estado_filtro === "Calificado" && fecha_hora_cita) {
                         leadPayload.appointment_date = fecha_hora_cita;
                     }
 
@@ -854,22 +885,17 @@ export async function POST(
                             .from("leads")
                             .update(leadPayload)
                             .eq("id", existingLeads[0].id);
-                        console.log(
-                            `✅ [${t.name}] Lead actualizado: ${nombre_cliente} → ${estado_filtro}`
-                        );
+                        console.log(`✅ [${t.name}] Lead actualizado: ${nombre_cliente} → ${estado_filtro}`);
                     } else {
                         await supabaseAdmin.from("leads").insert({
                             organization_id: tenantId,
                             ...leadPayload,
                         });
-                        console.log(
-                            `✅ [${t.name}] Lead creado: ${nombre_cliente} → ${estado_filtro}`
-                        );
+                        console.log(`✅ [${t.name}] Lead creado: ${nombre_cliente} → ${estado_filtro}`);
                     }
 
-                    // ── In-app notification (Derivado a Humano) ──────────
+                    // ── In-app notification for human handoff ─────────
                     if (estado_filtro === "Derivado a Humano") {
-                        // Resolve the lead id (may have just been created)
                         const { data: notifLead } = await supabaseAdmin
                             .from("leads")
                             .select("id")
@@ -890,18 +916,15 @@ export async function POST(
                             message: notifMessage,
                         });
                         console.log(`🔔 [${t.name}] Notificación creada: ${notifMessage}`);
-                        // TODO: Integrar Resend para enviar email al tenant.email
                     }
 
-
-                    const webhookUrl = process.env.MAKE_WEBHOOK_URL;
-                    if (webhookUrl) {
+                    // ── Optional Make/Zapier webhook ──────────────────
+                    const makeWebhookUrl = process.env.MAKE_WEBHOOK_URL;
+                    if (makeWebhookUrl) {
                         try {
-                            await fetch(webhookUrl, {
+                            await fetch(makeWebhookUrl, {
                                 method: "POST",
-                                headers: {
-                                    "Content-Type": "application/json",
-                                },
+                                headers: { "Content-Type": "application/json" },
                                 body: JSON.stringify({
                                     event: "lead_updated",
                                     tenant_id: tenantId,
@@ -910,26 +933,20 @@ export async function POST(
                                         nombre: nombre_cliente,
                                         telefono: phoneClean,
                                         estado: estado_filtro,
-                                        fecha_cita:
-                                            fecha_hora_cita || null,
+                                        fecha_cita: fecha_hora_cita || null,
                                         resumen: resumen_conversacion,
-                                        timestamp:
-                                            new Date().toISOString(),
+                                        timestamp: new Date().toISOString(),
                                     },
                                 }),
                             });
-                            console.log(
-                                "🔗 Webhook enviado a Make/Zapier"
-                            );
+                            console.log("🔗 Webhook enviado a Make/Zapier");
                         } catch (webhookErr) {
-                            console.error(
-                                "⚠️ Error enviando webhook (no bloqueante):",
-                                webhookErr
-                            );
+                            console.error("⚠️ Error enviando webhook (no bloqueante):", webhookErr);
                         }
                     }
 
-                    history.push({
+                    // Append tool response to the ephemeral turn array
+                    currentTurnMessages.push({
                         role: "tool",
                         tool_call_id: toolCall.id,
                         content: JSON.stringify({
@@ -941,35 +958,24 @@ export async function POST(
                 }
             }
 
-            // Follow-up call for final text response
-            const sanitizedHistoryFollowUp = sanitizeMessageHistory(history);
+            // Follow-up call — get the final conversational text after tool use
             const followUp = await tenantOpenai.chat.completions.create({
                 model: "gpt-4o-mini",
                 messages: [
                     { role: "system", content: systemPrompt },
-                    ...sanitizedHistoryFollowUp,
+                    ...sanitizeMessageHistory(currentTurnMessages),
                 ],
             });
 
-            botResponse =
-                followUp.choices[0].message.content ||
-                "¡Gracias por tu interés!";
+            botResponse = followUp.choices[0].message.content || "¡Gracias por tu interés!";
         }
 
-        // Save to history
-        history.push({ role: "assistant", content: botResponse });
-        if (history.length > 16) {
-            history.splice(0, history.length - 16);
-            // Re-sanitize after truncation to remove any orphaned tool messages
-            const trimmed = sanitizeMessageHistory(history);
-            history.length = 0;
-            history.push(...trimmed);
-        }
-
-        // Sanitize
+        // Sanitize before sending and saving
         botResponse = sanitizeBotResponse(botResponse);
 
-        // ── Save bot response to lead_messages ─────────────────
+        // ── 8. Persist bot response to Supabase ───────────────
+        // lead_messages is the single source of truth for history.
+        // No in-memory state to maintain or truncate.
         if (leadId && botResponse) {
             await supabaseAdmin.from("lead_messages").insert({
                 lead_id: leadId,
@@ -978,20 +984,13 @@ export async function POST(
             });
         }
 
-        // ── 7. Send response per provider ─────────────────────
+        // ── 9. Send reply per provider ─────────────────────────
         if (t.whatsapp_provider === "meta") {
-            const phoneNumberId =
-                t.whatsapp_credentials?.phone_number_id || "";
-            const accessToken =
-                t.whatsapp_credentials?.access_token || "";
+            const phoneNumberId = t.whatsapp_credentials?.phone_number_id || "";
+            const accessToken = t.whatsapp_credentials?.access_token || "";
 
             if (phoneNumberId && accessToken) {
-                await sendMetaReply(
-                    phoneNumberId,
-                    accessToken,
-                    phoneClean,
-                    botResponse
-                );
+                await sendMetaReply(phoneNumberId, accessToken, phoneClean, botResponse);
             }
             return new Response("OK", { status: 200 });
         }
