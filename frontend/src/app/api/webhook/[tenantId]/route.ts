@@ -1036,8 +1036,7 @@ ${hoursText}
         const currentTurnMessages: ChatCompletionMessageParam[] = [...dbHistory];
 
         const completion = await tenantOpenai.chat.completions.create({
-            model: "gpt-5.4-mini",
-            reasoning_effort: "none",
+            model: "gpt-4o-mini",
             messages: [
                 { role: "system", content: systemPrompt },
                 ...sanitizeMessageHistory(currentTurnMessages),
@@ -1542,8 +1541,7 @@ ${hoursText}
 
             // Follow-up call — get the final conversational text after tool use
             const followUp = await tenantOpenai.chat.completions.create({
-                model: "gpt-5.4-mini",
-                reasoning_effort: "none",
+                model: "gpt-4o-mini",
                 messages: [
                     { role: "system", content: systemPrompt },
                     ...sanitizeMessageHistory(currentTurnMessages),
