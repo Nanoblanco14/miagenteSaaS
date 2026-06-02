@@ -464,6 +464,7 @@ interface ParsedMessage {
     body: string;
     sender: string;
     phoneClean: string;
+    messageId?: string;
 }
 
 async function parseTwilioMessage(req: Request): Promise<ParsedMessage> {
@@ -489,7 +490,7 @@ async function parseMetaMessage(
     const body = msg.text?.body || "";
     const sender = msg.from || "";
     const phoneClean = sender.replace(/^\+/, "");
-    return { body, sender, phoneClean };
+    return { body, sender, phoneClean, messageId: msg.id };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -511,7 +512,7 @@ async function sendMetaReply(
     text: string
 ): Promise<void> {
     await fetch(
-        `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`,
+        `https://graph.facebook.com/v22.0/${phoneNumberId}/messages`,
         {
             method: "POST",
             headers: {
@@ -526,6 +527,35 @@ async function sendMetaReply(
             }),
         }
     );
+}
+
+// Mark the inbound message as read AND show a "typing…" indicator.
+// One Cloud API call does both. Fully non-blocking: never break the reply.
+async function sendMetaReadAndTyping(
+    phoneNumberId: string,
+    accessToken: string,
+    messageId: string
+): Promise<void> {
+    try {
+        await fetch(
+            `https://graph.facebook.com/v22.0/${phoneNumberId}/messages`,
+            {
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${accessToken}`,
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    messaging_product: "whatsapp",
+                    status: "read",
+                    message_id: messageId,
+                    typing_indicator: { type: "text" },
+                }),
+            }
+        );
+    } catch (e) {
+        console.error("[Meta read/typing] non-fatal:", e);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -680,15 +710,18 @@ async function loadConversationHistory(
         .from("lead_messages")
         .select("role, content")
         .eq("lead_id", leadId)
-        .order("created_at", { ascending: true })
+        .order("created_at", { ascending: false })
         .limit(limit);
 
     if (error || !data) return [];
 
+    // Fetch the newest `limit` rows (DESC) then restore chronological order,
+    // so long conversations keep the MOST RECENT context (not the oldest).
     // Only user/assistant turns — tool call rows are ephemeral within a
     // single request and are not stored in lead_messages.
     return data
         .filter((m) => m.role === "user" || m.role === "assistant")
+        .reverse()
         .map((m) => ({
             role: m.role as "user" | "assistant",
             content: m.content,
@@ -820,6 +853,20 @@ export async function POST(
         const { body: incomingMsg, sender, phoneClean } = parsed;
         console.log(`📩 [${t.name}] WhatsApp de ${sender}: ${incomingMsg}`);
 
+        // Human touch (Meta): mark as read + show "typing…" while we think.
+        if (
+            t.whatsapp_provider === "meta" &&
+            parsed.messageId &&
+            t.whatsapp_credentials?.phone_number_id &&
+            t.whatsapp_credentials?.access_token
+        ) {
+            await sendMetaReadAndTyping(
+                t.whatsapp_credentials.phone_number_id,
+                t.whatsapp_credentials.access_token,
+                parsed.messageId
+            );
+        }
+
         // ── 3. Load agent config ──────────────────────────────
         const { data: agent } = await supabaseAdmin
             .from("agents")
@@ -874,19 +921,30 @@ export async function POST(
                 .order("position", { ascending: true })
                 .limit(1);
 
-            // Upsert to prevent duplicates from race conditions
-            // (two simultaneous messages from same number)
-            await supabaseAdmin.from("leads").upsert(
-                {
+            // Plain INSERT — we already confirmed the lead does NOT exist
+            // (leadAlreadyExists === false). Do NOT use upsert/onConflict: the
+            // unique index idx_leads_org_phone_unique is PARTIAL (WHERE phone
+            // IS NOT NULL AND phone <> ''), so Postgres rejects ON CONFLICT
+            // against it (error 42P10) and the lead would never be created.
+            const { error: insertLeadError } = await supabaseAdmin
+                .from("leads")
+                .insert({
                     organization_id: tenantId,
                     stage_id: firstStage?.[0]?.id || "",
                     name: "Lead WhatsApp",
                     phone: phoneClean,
                     source: "whatsapp",
                     chat_status: "Contacto inicial",
-                },
-                { onConflict: "organization_id,phone", ignoreDuplicates: true }
-            );
+                });
+
+            // 23505 = unique violation: benign race (another request created
+            // the same lead). We re-select it below regardless.
+            if (insertLeadError && insertLeadError.code !== "23505") {
+                console.error(
+                    `❌ [${t.name}] Error creando lead para ${phoneClean}:`,
+                    insertLeadError
+                );
+            }
         }
 
         // ── 4b. Resolve leadId ────────────────────────────────
@@ -894,14 +952,26 @@ export async function POST(
         if (leadAlreadyExists) {
             leadId = existingForStatus[0].id;
         } else {
-            const { data: newLeadRow } = await supabaseAdmin
+            const { data: newLeadRow, error: resolveLeadError } = await supabaseAdmin
                 .from("leads")
                 .select("id")
                 .eq("organization_id", tenantId)
                 .eq("phone", phoneClean)
                 .limit(1)
                 .single();
+            if (resolveLeadError) {
+                console.error(
+                    `❌ [${t.name}] Error resolviendo leadId para ${phoneClean}:`,
+                    resolveLeadError
+                );
+            }
             leadId = newLeadRow?.id ?? null;
+        }
+
+        if (!leadId) {
+            console.error(
+                `❌ [${t.name}] leadId null para ${phoneClean} — la conversación NO se guardará (sin memoria).`
+            );
         }
 
         // ── 4c. Persist the incoming user message ─────────────
