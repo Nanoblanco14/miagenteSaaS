@@ -59,30 +59,48 @@ export async function POST(req: NextRequest) {
             return apiError("WhatsApp no configurado. Conecta tu cuenta primero.", 400);
         }
 
-        // Build components array for Meta API
+        // Build components array for Meta API.
+        // Meta REQUIRES an `example` object for every component that contains
+        // {{n}} placeholders, or it rejects the template with INVALID_FORMAT.
         const components: Record<string, unknown>[] = [];
+        const maxVarNum = (t: string): number => {
+            const nums = (t.match(/\{\{\s*(\d+)\s*\}\}/g) || []).map((m) =>
+                parseInt(m.replace(/[^0-9]/g, ""), 10)
+            );
+            return nums.length ? Math.max(...nums) : 0;
+        };
 
-        // Header (optional)
+        // Header (optional) — Meta allows at most ONE variable in a text header
         if (header_text?.trim()) {
-            components.push({
-                type: "HEADER",
-                format: "TEXT",
-                text: header_text.trim(),
-            });
+            const ht = header_text.trim();
+            const headerComp: Record<string, unknown> = { type: "HEADER", format: "TEXT", text: ht };
+            if (maxVarNum(ht) > 0) {
+                headerComp.example = { header_text: ["Ejemplo"] };
+            }
+            components.push(headerComp);
         }
 
-        // Body (required)
-        components.push({
-            type: "BODY",
-            text: body_text.trim(),
-        });
+        // Body (required) — example.body_text is an array-of-arrays of samples
+        const bt = body_text.trim();
+        const bodyComp: Record<string, unknown> = { type: "BODY", text: bt };
+        const bodyVars = maxVarNum(bt);
+        if (bodyVars > 0) {
+            bodyComp.example = {
+                body_text: [Array.from({ length: bodyVars }, (_, i) => `Ejemplo ${i + 1}`)],
+            };
+        }
+        components.push(bodyComp);
 
-        // Footer (optional)
+        // Footer (optional) — Meta does NOT allow variables in the footer; strip them.
         if (footer_text?.trim()) {
-            components.push({
-                type: "FOOTER",
-                text: footer_text.trim(),
-            });
+            const ft = footer_text
+                .replace(/\{\{\s*\d+\s*\}\}/g, "")
+                .replace(/^[\s\-—|:]+/, "")
+                .replace(/\s{2,}/g, " ")
+                .trim();
+            if (ft) {
+                components.push({ type: "FOOTER", text: ft });
+            }
         }
 
         // Buttons (optional)
