@@ -487,9 +487,38 @@ async function parseMetaMessage(
     if (!messages || messages.length === 0) return null;
 
     const msg = messages[0];
-    const body = msg.text?.body || "";
     const sender = msg.from || "";
     const phoneClean = sender.replace(/^\+/, "");
+
+    // Texto normal.
+    let body: string = msg.text?.body || "";
+
+    // Interactivos (respuestas de botones/listas) traen el texto en otra rama.
+    if (!body) {
+        body =
+            msg.button?.text ||
+            msg.interactive?.button_reply?.title ||
+            msg.interactive?.list_reply?.title ||
+            "";
+    }
+
+    // Adjuntos (audio, imagen, documento, sticker, ubicación): no descartamos
+    // el mensaje en silencio — dejamos una marca legible para que la
+    // conversación se registre y el bot pueda pedir texto.
+    if (!body && msg.type && msg.type !== "text") {
+        const captions: Record<string, string> = {
+            audio: "🎤 (audio)",
+            voice: "🎤 (nota de voz)",
+            image: "🖼️ (imagen)",
+            video: "🎬 (video)",
+            document: "📎 (documento)",
+            sticker: "(sticker)",
+            location: "📍 (ubicación)",
+            contacts: "👤 (contacto)",
+        };
+        body = msg[msg.type]?.caption || captions[msg.type] || `(${msg.type})`;
+    }
+
     return { body, sender, phoneClean, messageId: msg.id };
 }
 
@@ -505,28 +534,54 @@ function buildTwilioResponse(text: string): Response {
     return new Response(xml, { headers: { "Content-Type": "text/xml" } });
 }
 
+interface MetaSendResult {
+    ok: boolean;
+    status: number;
+    errorCode?: number;
+    errorMessage?: string;
+}
+
 async function sendMetaReply(
     phoneNumberId: string,
     accessToken: string,
     recipientPhone: string,
     text: string
-): Promise<void> {
-    await fetch(
-        `https://graph.facebook.com/v22.0/${phoneNumberId}/messages`,
-        {
-            method: "POST",
-            headers: {
-                Authorization: `Bearer ${accessToken}`,
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-                messaging_product: "whatsapp",
-                to: recipientPhone,
-                type: "text",
-                text: { body: text },
-            }),
+): Promise<MetaSendResult> {
+    try {
+        const res = await fetch(
+            `https://graph.facebook.com/v22.0/${phoneNumberId}/messages`,
+            {
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${accessToken}`,
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    messaging_product: "whatsapp",
+                    to: recipientPhone,
+                    type: "text",
+                    text: { body: text },
+                }),
+            }
+        );
+
+        if (!res.ok) {
+            // fetch NO lanza en 4xx/5xx — hay que inspeccionar el body para
+            // detectar token vencido (190), fuera de ventana de 24h (131047),
+            // cuenta restringida, etc. Sin esto, el bot queda mudo en silencio.
+            const errData = await res.json().catch(() => ({}));
+            const errorCode = errData?.error?.code;
+            const errorMessage = errData?.error?.message || `HTTP ${res.status}`;
+            console.error(
+                `❌ [Meta send] Falló envío a ${recipientPhone}: ${res.status} code=${errorCode} — ${errorMessage}`
+            );
+            return { ok: false, status: res.status, errorCode, errorMessage };
         }
-    );
+        return { ok: true, status: res.status };
+    } catch (e) {
+        console.error(`❌ [Meta send] Error de red enviando a ${recipientPhone}:`, e);
+        return { ok: false, status: 0, errorMessage: "network_error" };
+    }
 }
 
 // Mark the inbound message as read AND show a "typing…" indicator.
@@ -885,7 +940,12 @@ export async function POST(
             fullPrompt += `\n\n═══ ENLACE DE AGENDAMIENTO ═══\nCuando el prospecto califique, entrégale este link para agendar: ${agent.booking_url}`;
         }
 
-        // ── 4. Find or create lead; check bot-paused state ────
+        // ── 4. Find or create lead; ALWAYS capture the inbound message ────
+        //  Regla de oro: NUNCA descartamos un mensaje entrante en silencio.
+        //  Aunque el bot esté pausado (toma humana) o la org haya superado el
+        //  límite de su plan, primero persistimos el lead y el mensaje para que
+        //  el dueño SIEMPRE vea la conversación en el inbox. Recién después
+        //  decidimos si omitir la respuesta automática de la IA (ver 4f).
         const { data: existingForStatus } = await supabaseAdmin
             .from("leads")
             .select("id, is_bot_paused")
@@ -894,22 +954,17 @@ export async function POST(
             .limit(1);
 
         const leadAlreadyExists = existingForStatus && existingForStatus.length > 0;
-
-        // ── 4a. Human takeover — early exit if bot is paused ──
-        if (leadAlreadyExists && existingForStatus[0].is_bot_paused) {
-            console.log(`⏸️ [${t.name}] Bot pausado para ${phoneClean}. Mensaje ignorado.`);
-            if (t.whatsapp_provider === "twilio") {
-                return buildTwilioResponse("");
-            }
-            return new Response("OK", { status: 200 });
-        }
+        const botPaused = !!(leadAlreadyExists && existingForStatus[0].is_bot_paused);
+        let overPlanLimit = false;
 
         if (!leadAlreadyExists) {
-            // ── Plan limit check for new leads ──
+            // El límite del plan es INFORMATIVO para la captura: registramos el
+            // lead igual y avisamos al dueño (4f), en vez de perder al cliente
+            // en silencio (que era el bug que apagaba números nuevos).
             const leadLimit = await checkResourceLimit(tenantId, "leads");
-            if (!leadLimit.allowed) {
-                console.warn(`[Webhook] Lead limit reached for org ${tenantId} (${leadLimit.current}/${leadLimit.limit})`);
-                return new Response("OK", { status: 200 });
+            overPlanLimit = !leadLimit.allowed;
+            if (overPlanLimit) {
+                console.warn(`[Webhook] Límite de leads alcanzado en org ${tenantId} (${leadLimit.current}/${leadLimit.limit}) — se registra igual y se avisa al dueño`);
             }
 
             // First contact — create lead with default initial status.
@@ -926,16 +981,20 @@ export async function POST(
             // unique index idx_leads_org_phone_unique is PARTIAL (WHERE phone
             // IS NOT NULL AND phone <> ''), so Postgres rejects ON CONFLICT
             // against it (error 42P10) and the lead would never be created.
+            // stage_id es UUID NOT NULL: solo lo incluimos si existe una etapa,
+            // para evitar 22P02 (invalid input syntax for uuid) con string vacío.
+            const leadInsert: Record<string, unknown> = {
+                organization_id: tenantId,
+                name: "Lead WhatsApp",
+                phone: phoneClean,
+                source: "whatsapp",
+                chat_status: "Contacto inicial",
+            };
+            if (firstStage?.[0]?.id) leadInsert.stage_id = firstStage[0].id;
+
             const { error: insertLeadError } = await supabaseAdmin
                 .from("leads")
-                .insert({
-                    organization_id: tenantId,
-                    stage_id: firstStage?.[0]?.id || "",
-                    name: "Lead WhatsApp",
-                    phone: phoneClean,
-                    source: "whatsapp",
-                    chat_status: "Contacto inicial",
-                });
+                .insert(leadInsert);
 
             // 23505 = unique violation: benign race (another request created
             // the same lead). We re-select it below regardless.
@@ -1005,6 +1064,35 @@ export async function POST(
                 .from("leads")
                 .update({ chat_status: liveChatStatus })
                 .eq("id", leadId);
+        }
+
+        // ── 4f. Skip the automated AI reply (message already saved above) ──
+        //  El mensaje entrante YA quedó persistido, así que el dueño lo ve en
+        //  el inbox. Aquí solo evitamos la respuesta automática cuando:
+        //   • el bot está pausado (toma humana), o
+        //   • la org superó el límite de leads de su plan.
+        if (botPaused) {
+            console.log(`⏸️ [${t.name}] Bot pausado para ${phoneClean} — mensaje guardado, sin respuesta automática.`);
+            if (t.whatsapp_provider === "twilio") return buildTwilioResponse("");
+            return new Response("OK", { status: 200 });
+        }
+
+        if (overPlanLimit) {
+            // Avisar al dueño en la campana del dashboard (no-bloqueante).
+            if (leadId) {
+                try {
+                    await supabaseAdmin.from("notifications").insert({
+                        tenant_id: tenantId,
+                        lead_id: leadId,
+                        type: "plan_limit",
+                        message: `Alcanzaste el límite de leads de tu plan. El mensaje de ${phoneClean} se guardó, pero el bot no respondió automáticamente. Actualiza tu plan para reactivar las respuestas.`,
+                    });
+                } catch (e) {
+                    console.error("[Webhook] No se pudo crear notificación de límite de plan:", e);
+                }
+            }
+            if (t.whatsapp_provider === "twilio") return buildTwilioResponse("");
+            return new Response("OK", { status: 200 });
         }
 
         // ── 5. Fetch pipeline stages + catalog + knowledge ────
@@ -1105,15 +1193,36 @@ ${hoursText}
         // to Supabase — only the final assistant text response is persisted.
         const currentTurnMessages: ChatCompletionMessageParam[] = [...dbHistory];
 
-        const completion = await tenantOpenai.chat.completions.create({
-            model: "gpt-4o-mini",
-            messages: [
-                { role: "system", content: systemPrompt },
-                ...sanitizeMessageHistory(currentTurnMessages),
-            ],
-            tools: dynamicTools,
-            tool_choice: "auto",
-        });
+        let completion;
+        try {
+            completion = await tenantOpenai.chat.completions.create({
+                model: "gpt-4o-mini",
+                messages: [
+                    { role: "system", content: systemPrompt },
+                    ...sanitizeMessageHistory(currentTurnMessages),
+                ],
+                tools: dynamicTools,
+                tool_choice: "auto",
+            });
+        } catch (aiErr) {
+            // Key del tenant inválida / sin crédito / rate limit. El mensaje del
+            // cliente YA está guardado; no respondemos automáticamente pero
+            // devolvemos 200 para que Meta no reintente en bucle, y avisamos al
+            // dueño en la campana del dashboard.
+            console.error(`❌ [${t.name}] OpenAI falló para ${phoneClean}:`, aiErr);
+            if (leadId) {
+                try {
+                    await supabaseAdmin.from("notifications").insert({
+                        tenant_id: tenantId,
+                        lead_id: leadId,
+                        type: "ai_error",
+                        message: `El asistente no pudo responder a ${phoneClean}: error de OpenAI. Revisa tu API key de OpenAI y su saldo en Configuración.`,
+                    });
+                } catch { /* no-op */ }
+            }
+            if (t.whatsapp_provider === "twilio") return buildTwilioResponse("");
+            return new Response("OK", { status: 200 });
+        }
 
         const assistantMsg = completion.choices[0].message;
         let botResponse = assistantMsg.content || "";
@@ -1610,15 +1719,20 @@ ${hoursText}
             }
 
             // Follow-up call — get the final conversational text after tool use
-            const followUp = await tenantOpenai.chat.completions.create({
-                model: "gpt-4o-mini",
-                messages: [
-                    { role: "system", content: systemPrompt },
-                    ...sanitizeMessageHistory(currentTurnMessages),
-                ],
-            });
-
-            botResponse = followUp.choices[0].message.content || "¡Gracias por tu interés!";
+            try {
+                const followUp = await tenantOpenai.chat.completions.create({
+                    model: "gpt-4o-mini",
+                    messages: [
+                        { role: "system", content: systemPrompt },
+                        ...sanitizeMessageHistory(currentTurnMessages),
+                    ],
+                });
+                botResponse = followUp.choices[0].message.content || "¡Gracias por tu interés!";
+            } catch (aiErr) {
+                console.error(`❌ [${t.name}] OpenAI follow-up falló para ${phoneClean}:`, aiErr);
+                // La acción de CRM/cita ya se ejecutó arriba; damos un cierre genérico.
+                botResponse = "¡Listo! Quedó registrado. En un momento te confirmamos los detalles.";
+            }
         }
 
         // Sanitize before sending and saving
@@ -1641,7 +1755,27 @@ ${hoursText}
             const accessToken = t.whatsapp_credentials?.access_token || "";
 
             if (phoneNumberId && accessToken) {
-                await sendMetaReply(phoneNumberId, accessToken, phoneClean, botResponse);
+                const sendResult = await sendMetaReply(phoneNumberId, accessToken, phoneClean, botResponse);
+                // Si el envío falla (token vencido = 190, fuera de ventana 24h =
+                // 131047, etc.) avisamos al dueño; antes esto fallaba en silencio
+                // y el bot quedaba mudo sin ninguna traza.
+                if (!sendResult.ok && leadId) {
+                    const hint = sendResult.errorCode === 190
+                        ? "Tu conexión de WhatsApp (token de Meta) expiró o fue revocada. Reconéctala en Configuración."
+                        : sendResult.errorCode === 131047
+                            ? "La ventana de 24h de WhatsApp se cerró; para retomar debes usar una plantilla aprobada."
+                            : `Meta rechazó el envío (código ${sendResult.errorCode ?? sendResult.status}). Revisa tu conexión de WhatsApp.`;
+                    try {
+                        await supabaseAdmin.from("notifications").insert({
+                            tenant_id: tenantId,
+                            lead_id: leadId,
+                            type: "send_failed",
+                            message: `No se pudo entregar la respuesta a ${phoneClean}. ${hint}`,
+                        });
+                    } catch { /* no-op */ }
+                }
+            } else {
+                console.error(`❌ [${t.name}] Sin credenciales Meta (phone_number_id/access_token) para responder a ${phoneClean}.`);
             }
             return new Response("OK", { status: 200 });
         }
