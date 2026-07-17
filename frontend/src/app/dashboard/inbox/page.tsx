@@ -319,6 +319,18 @@ export default function InboxPage() {
         setError(null);
         try {
             const res = await fetch(`/api/inbox?org_id=${organization.id}`);
+            // fetch no lanza en 4xx/5xx: un 401/403/500 traía { error } (sin
+            // data) y el inbox mostraba "no hay chats" en vez del error real.
+            if (!res.ok) {
+                const body = await res.json().catch(() => ({}));
+                console.error("Inbox load failed:", res.status, body);
+                setError(
+                    body?.error ||
+                    `No se pudieron cargar las conversaciones (error ${res.status}).`
+                );
+                setLoading(false);
+                return;
+            }
             const { data } = await res.json();
             if (data) setConversations(data);
         } catch (err) {
@@ -449,7 +461,8 @@ export default function InboxPage() {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ lead_id: selectedLeadId, message: newMessage }),
             });
-            const { data } = await res.json();
+            const body = await res.json();
+            const data = body?.data;
             if (data?.success) {
                 // Add message locally for instant feedback
                 const localMsg: ChatMessage = {
@@ -472,6 +485,18 @@ export default function InboxPage() {
                 );
 
                 inputRef.current?.focus();
+
+                // El mensaje quedó guardado, pero WhatsApp pudo rechazar la
+                // ENTREGA (token vencido, ventana de 24h cerrada). Avisamos en
+                // vez de fingir que se envió.
+                if (body?.whatsapp_error) {
+                    setError(
+                        "El mensaje se guardó, pero WhatsApp no lo entregó al cliente. " +
+                        "Puede que tu conexión de WhatsApp haya expirado o que la ventana de 24h esté cerrada (usa una plantilla)."
+                    );
+                }
+            } else {
+                setError("No se pudo enviar el mensaje. Intenta de nuevo.");
             }
         } catch (err) {
             console.error("Send message failed:", err);

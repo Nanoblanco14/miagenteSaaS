@@ -24,12 +24,15 @@ export async function GET(req: NextRequest) {
         const db = getSupabaseAdmin();
 
         // Get all leads with their message count and latest message
+        // LEFT join (sin !inner): un lead con stage_id vacío o con una etapa
+        // borrada DEBE seguir apareciendo en el inbox. Con !inner desaparecía
+        // por completo de la bandeja.
         const { data: leads, error: leadsError } = await db
             .from("leads")
             .select(`
                 id, name, phone, source, stage_id, chat_status,
                 is_bot_paused, created_at,
-                pipeline_stages!inner(name, color)
+                pipeline_stages(name, color)
             `)
             .eq("organization_id", orgId)
             .eq("source", "whatsapp")
