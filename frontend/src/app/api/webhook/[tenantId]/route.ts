@@ -441,6 +441,20 @@ Tu ÚNICA fuente de verdad de productos, servicios o propiedades es la sección 
 Esta regla es INQUEBRANTABLE para TODAS las plantillas de industria.
 
 ═══════════════════════════════════════════════════════════════
+🛑 REGLA DE DATOS DE CONTACTO Y UBICACIÓN — ANTI-ALUCINACIÓN (HARD BLOCK UNIVERSAL)
+═══════════════════════════════════════════════════════════════
+Direcciones, números de calle, comunas, teléfonos, correos, links/URLs, horarios de atención, nombres de ejecutivos, metrajes, precios y fechas de entrega SOLO pueden salir TEXTUALMENTE de este prompt (instrucciones del negocio, catálogo, conocimiento adicional o FAQ).
+🚫 TIENES ESTRICTAMENTE PROHIBIDO:
+  - Inventar, completar o "aproximar" una dirección o número de calle (ej: "Avenida del Parque 12345"). Saber que algo queda "cerca de" un lugar NO te autoriza a construir una dirección exacta.
+  - Inventar teléfonos, correos, links o nombres de personas.
+  - Calcular o redondear cifras (precio por m², metrajes, cuotas) que no estén escritas explícitamente.
+✅ SI EL DATO EXACTO NO ESTÁ EN ESTE PROMPT:
+  - Dilo con honestidad: "Ese dato exacto te lo confirma un ejecutivo" y ofrece que lo contacten.
+  - Puedes compartir solo la referencia general que SÍ aparece escrita (ej: "queda cerca del Parque Metropolitano"), sin agregarle detalles.
+  - Ejecuta gestionar_lead_crm con estado_filtro="Derivado a Humano" si el cliente necesita el dato para avanzar (ej: ir a la sala de ventas).
+Un dato inventado (sobre todo una dirección) hace que el cliente vaya a un lugar equivocado y destruye la confianza en la empresa. Esta regla es INQUEBRANTABLE.
+
+═══════════════════════════════════════════════════════════════
 🔄 REGLA DE REPROGRAMACIÓN — HARD BLOCK UNIVERSAL
 ═══════════════════════════════════════════════════════════════
 Si un cliente pide cambiar la fecha u hora de una cita ya agendada, esto es un indicador de ALTO INTERÉS en el servicio.
@@ -1197,6 +1211,7 @@ ${hoursText}
         try {
             completion = await tenantOpenai.chat.completions.create({
                 model: "gpt-4o-mini",
+                temperature: 0.3, // respuestas factuales: baja creatividad = menos datos inventados
                 messages: [
                     { role: "system", content: systemPrompt },
                     ...sanitizeMessageHistory(currentTurnMessages),
@@ -1722,6 +1737,7 @@ ${hoursText}
             try {
                 const followUp = await tenantOpenai.chat.completions.create({
                     model: "gpt-4o-mini",
+                    temperature: 0.3, // respuestas factuales: baja creatividad = menos datos inventados
                     messages: [
                         { role: "system", content: systemPrompt },
                         ...sanitizeMessageHistory(currentTurnMessages),
