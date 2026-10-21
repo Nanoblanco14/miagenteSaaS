@@ -1,6 +1,7 @@
 "use client";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { supabase } from "@/lib/supabase";
 import { Bot, Eye, EyeOff, Sparkles } from "lucide-react";
 
@@ -173,6 +174,7 @@ export default function LoginPage() {
                             isLogin ? "Iniciar Sesión" : "Crear Cuenta"
                         )}
                     </button>
+                    {isLogin && <Link href="/auth/recover" style={{ display: "block", marginTop: "16px", textAlign: "center", color: "var(--accent-light)", fontSize: "0.85rem" }}>¿Olvidaste tu contraseña?</Link>}
                 </form>}
 
                 {!signupSuccess && (
