@@ -3,6 +3,7 @@ import { useOrg } from "@/lib/org-context";
 import { useEffect, useState, useCallback } from "react";
 import { updateTenantSettings, loadTenantSettings } from "./actions";
 import { Loader2, AlertCircle } from "lucide-react";
+import Link from "next/link";
 import {
     OrgInfoSection,
     ApiKeySection,
@@ -143,6 +144,7 @@ export default function SettingsPage() {
                 {/* ── General ─────────────────────────────────── */}
                 <GroupHeader label="General" />
                 <OrgInfoSection organization={organization} role={role} />
+                <Link href="/auth/password" className="glass-card" style={{ display: "block", padding: "20px", color: "var(--accent-light)" }}>Cambiar mi contraseña</Link>
                 <ApiKeySection
                     apiKey={apiKey}
                     onApiKeyChange={setApiKey}
