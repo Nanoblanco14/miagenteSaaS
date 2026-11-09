@@ -284,6 +284,25 @@ function buildSystemPrompt(
         timeZone: "America/Santiago",
     });
 
+    // Calendario explícito de los próximos 21 días. gpt-4o-mini calcula mal
+    // días de la semana (llegó a decir "el 12 de noviembre no existe"): le
+    // damos la tabla ya resuelta en vez de pedirle que la calcule.
+    const [cy, cm, cd] = now
+        .toLocaleDateString("en-CA", { timeZone: "America/Santiago" })
+        .split("-")
+        .map(Number);
+    const upcomingCalendar = Array.from({ length: 21 }, (_, i) => {
+        const d = new Date(Date.UTC(cy, cm - 1, cd + i, 12));
+        const label = d.toLocaleDateString("es-CL", {
+            timeZone: "UTC",
+            weekday: "long",
+            day: "numeric",
+            month: "long",
+        });
+        const iso = d.toISOString().slice(0, 10);
+        return `  - ${label} (${iso})${i === 0 ? " ← HOY" : i === 1 ? " ← mañana" : ""}`;
+    }).join("\n");
+
     // ── Tone instruction block ─────────────────────────────
     const toneBlock = conversationTone
         ? `\n\n═══ TONO DE CONVERSACIÓN ═══
@@ -337,6 +356,11 @@ IMPORTANTE: Estas respuestas son la fuente de verdad del negocio. No inventes in
 ⏰ Hora actual (Chile): ${chileTime}
 🗓️ Timestamp completo: ${chileFull}
 USA ESTA FECHA COMO REFERENCIA ABSOLUTA para cualquier cálculo de fechas.
+
+📆 CALENDARIO DE LOS PRÓXIMOS DÍAS (ya calculado, NO lo recalcules — úsalo para saber qué día de la semana es cada fecha):
+${upcomingCalendar}
+
+🚫 NUNCA digas que un día es feriado, que ese día no se atiende o que una fecha "no existe" basándote en tu propio conocimiento. Toda fecha del calendario de arriba existe. Si tienes la herramienta verificar_disponibilidad, ella es la ÚNICA fuente sobre qué días y horas hay atención: si devuelve horarios, ese día SÍ se atiende. Si una herramienta responde con un error, dile al cliente el motivo REAL que indica la herramienta (por ejemplo "esa hora ya está tomada"), nunca inventes otro motivo.
 
 ═══ REGLAS DE MANEJO DE FECHAS ═══
 ⚠️ Si el cliente menciona un día relativo ("mañana", "el próximo lunes", "pasado mañana", "esta semana", "el viernes"), DEBES:
@@ -865,6 +889,77 @@ export async function GET(
     return new Response("Forbidden", { status: 403 });
 }
 
+// ── Etapa del pipeline que corresponde a cada estado del CRM ──
+// Primero por nombre ("Visita Agendada", "Cita", ...), si no por posición.
+type PipelineStage = { id: string; name: string; position: number };
+function pickStageFor(estado: string, allStages: PipelineStage[]): PipelineStage | undefined {
+    if (allStages.length === 0) return undefined;
+    const stageMap: Record<string, string[]> = {
+        "Interesado": ["interes", "contacto", "consulta"],
+        "Calificado": ["isita", "agend", "calific", "cita", "reuni"],
+        "Descartado": ["escart", "perdid", "cancel", "cerrado"],
+        "Derivado a Humano": ["deriv", "human", "escala"],
+    };
+    for (const term of stageMap[estado] || []) {
+        const match = allStages.find(s => s.name.toLowerCase().includes(term));
+        if (match) return match;
+    }
+    if (estado === "Interesado" && allStages.length >= 2) return allStages[1];
+    if (estado === "Calificado" && allStages.length >= 3) return allStages[2];
+    if (estado === "Derivado a Humano" && allStages.length >= 2) return allStages[1];
+    return allStages[0];
+}
+
+// ── Reflejar en el lead que tiene cita ─────────────────────────
+// Guarda appointment_date / chat_status y lo avanza a la etapa de visita
+// agendada. Solo avanza (nunca retrocede a un lead que ya está más adelante,
+// p.ej. en "Cierre") y respeta las reglas de transición del pipeline.
+async function markLeadAsBooked(tenantId: string, leadId: string, fechaHora: string, reason: string) {
+    try {
+        const [{ data: stages }, { data: lead }] = await Promise.all([
+            supabaseAdmin
+                .from("pipeline_stages")
+                .select("id, name, position")
+                .eq("organization_id", tenantId)
+                .order("position", { ascending: true }),
+            supabaseAdmin.from("leads").select("stage_id").eq("id", leadId).single(),
+        ]);
+
+        const update: Record<string, string> = {
+            appointment_date: fechaHora,
+            chat_status: "Cita agendada",
+        };
+
+        const target = pickStageFor("Calificado", (stages || []) as PipelineStage[]);
+        const currentStageId: string | null = lead?.stage_id || null;
+        const current = (stages || []).find(s => s.id === currentStageId);
+        if (target && target.id !== currentStageId && (!current || current.position < target.position)) {
+            const transition = await validateAndRecordTransition(
+                supabaseAdmin, tenantId, leadId, currentStageId, target.id, "ai", reason, { fecha_hora_cita: fechaHora }
+            );
+            if (transition.valid) update.stage_id = target.id;
+        }
+
+        await supabaseAdmin.from("leads").update(update).eq("id", leadId);
+    } catch (err) {
+        // No bloqueante: la cita ya está en la agenda, que es lo crítico.
+        console.error("⚠️ markLeadAsBooked error (no bloqueante):", err);
+    }
+}
+
+// Horarios libres de ese día, para que el bot ofrezca alternativas reales
+// cuando una reserva falla (en vez de inventar motivos como "es feriado").
+async function freeSlotsForDay(tenantId: string, fechaHora: string, duration?: number): Promise<string[]> {
+    try {
+        const day = fechaHora.slice(0, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return [];
+        const slots = await getAvailableSlots(tenantId, day, duration);
+        return slots.map(s => s.start.slice(11, 16));
+    } catch {
+        return [];
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  📅 BOOK FROM CHAT — único camino para crear una cita desde el bot
 // ═══════════════════════════════════════════════════════════════
@@ -882,7 +977,7 @@ async function bookFromChat(params: {
     servicioNombre?: string;
     notas?: string;
     defaultDuration: number;
-}): Promise<{ success: true; appointmentId: string; created: boolean } | { success: false; error: string }> {
+}): Promise<{ success: true; appointmentId: string; created: boolean } | { success: false; error: string; horariosLibres: string[] }> {
     const { tenantId, leadId, fechaHora } = params;
 
     const { data: existing } = await supabaseAdmin
@@ -915,7 +1010,7 @@ async function bookFromChat(params: {
 
     const start = new Date(fechaHora);
     if (isNaN(start.getTime())) {
-        return { success: false, error: `Fecha/hora inválida: ${fechaHora}` };
+        return { success: false, error: `Fecha/hora inválida: ${fechaHora}`, horariosLibres: [] };
     }
     const endTime = new Date(start.getTime() + duration * 60000).toISOString();
     const servicio = params.servicioNombre || "Visita";
@@ -929,7 +1024,11 @@ async function bookFromChat(params: {
         notes: params.notas || `Cita para ${servicio}. Cliente: ${params.nombreCliente}`,
     });
     if (!result.success) {
-        return { success: false, error: result.error || "Error al crear la cita." };
+        return {
+            success: false,
+            error: result.error || "Error al crear la cita.",
+            horariosLibres: await freeSlotsForDay(tenantId, fechaHora, duration),
+        };
     }
 
     // Update lead name if still generic
@@ -941,6 +1040,9 @@ async function bookFromChat(params: {
     if (currentLead?.name === "Lead WhatsApp" || currentLead?.name?.startsWith("Lead")) {
         await supabaseAdmin.from("leads").update({ name: params.nombreCliente }).eq("id", leadId);
     }
+
+    // Que el pipeline también lo refleje (antes solo pasaba vía gestionar_lead_crm)
+    await markLeadAsBooked(tenantId, leadId, fechaHora, `IA agendó cita para ${formatChileDate(fechaHora)}`);
 
     // Send confirmation — try template first, fallback to text
     const confirmFallback = `✅ *Cita confirmada*\nServicio: ${servicio}\nFecha: ${formatChileDate(fechaHora)}\n\n¡Te esperamos!\n\nPara cancelar o cambiar tu cita, escribe "cancelar cita" o "cambiar cita".`;
@@ -1420,7 +1522,10 @@ ${hoursText}
                                 content: JSON.stringify({
                                     success: false,
                                     error: `La cita NO quedó registrada en la agenda: ${booking.error}`,
-                                    mensaje: "NO confirmes la cita al cliente. Ofrécele otro horario disponible.",
+                                    horarios_libres_ese_dia: booking.horariosLibres,
+                                    mensaje: booking.horariosLibres.length > 0
+                                        ? "NO confirmes la cita. Dile al cliente el motivo real (el de 'error', no inventes otro como feriados) y ofrécele uno de horarios_libres_ese_dia."
+                                        : "NO confirmes la cita. Dile al cliente el motivo real (el de 'error', no inventes otro como feriados) y pregúntale por otro día.",
                                 }),
                             });
                             continue;
@@ -1439,48 +1544,9 @@ ${hoursText}
                         .eq("organization_id", tenantId)
                         .order("position", { ascending: true });
 
-                    let targetStageId: string | undefined;
-                    let targetStageLabel = "";
-
-                    if (allStages && allStages.length > 0) {
-                        // Smart stage matching based on estado_filtro
-                        const stageMap: Record<string, string[]> = {
-                            "Interesado": ["interes", "contacto", "consulta"],
-                            "Calificado": ["isita", "agend", "calific", "cita", "reuni"],
-                            "Descartado": ["escart", "perdid", "cancel", "cerrado"],
-                            "Derivado a Humano": ["deriv", "human", "escala"],
-                        };
-
-                        const searchTerms = stageMap[estado_filtro] || [];
-                        for (const term of searchTerms) {
-                            const match = allStages.find(s => s.name.toLowerCase().includes(term));
-                            if (match) {
-                                targetStageId = match.id;
-                                targetStageLabel = match.name;
-                                break;
-                            }
-                        }
-
-                        // Fallback by position if no name match
-                        if (!targetStageId) {
-                            if (estado_filtro === "Interesado" && allStages.length >= 2) {
-                                // 2nd stage (after "Nuevo Lead")
-                                targetStageId = allStages[1].id;
-                                targetStageLabel = allStages[1].name;
-                            } else if (estado_filtro === "Calificado" && allStages.length >= 3) {
-                                // 3rd stage (Visita Agendada position)
-                                targetStageId = allStages[2].id;
-                                targetStageLabel = allStages[2].name;
-                            } else if (estado_filtro === "Derivado a Humano" && allStages.length >= 2) {
-                                targetStageId = allStages[1].id;
-                                targetStageLabel = allStages[1].name;
-                            } else {
-                                // Ultimate fallback: first stage
-                                targetStageId = allStages[0].id;
-                                targetStageLabel = allStages[0].name;
-                            }
-                        }
-                    }
+                    const targetStage = pickStageFor(estado_filtro, (allStages || []) as PipelineStage[]);
+                    let targetStageId: string | undefined = targetStage?.id;
+                    let targetStageLabel = targetStage?.name || "";
 
                     // ── Upsert lead with CRM data ──────────────────
                     const { data: existingLeads } = await supabaseAdmin
@@ -1740,7 +1806,8 @@ ${hoursText}
                             content: JSON.stringify({
                                 exito: false,
                                 error: result.error,
-                                mensaje: "No se pudo agendar. Sugiere otro horario.",
+                                horarios_libres_ese_dia: "horariosLibres" in result ? result.horariosLibres : [],
+                                mensaje: "No se pudo agendar: NO confirmes la cita. Dile al cliente el motivo real (el de 'error', no inventes otro como feriados) y ofrécele uno de horarios_libres_ese_dia, o pregúntale por otro día si no hay.",
                             }),
                         });
                     }
@@ -1815,6 +1882,7 @@ ${hoursText}
                                 });
 
                                 if (result.success) {
+                                    await markLeadAsBooked(tenantId, leadId!, args.nueva_fecha_hora, `IA reprogramó cita para ${formatChileDate(args.nueva_fecha_hora)}`);
                                     const rescheduleFallback = `🔄 *Cita reprogramada*\nNueva fecha: ${formatChileDate(args.nueva_fecha_hora)}\n\n¡Te esperamos!`;
                                     sendAutoTemplate({
                                         orgId: tenantId,
