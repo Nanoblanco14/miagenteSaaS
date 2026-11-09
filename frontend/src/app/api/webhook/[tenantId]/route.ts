@@ -866,6 +866,97 @@ export async function GET(
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  📅 BOOK FROM CHAT — único camino para crear una cita desde el bot
+// ═══════════════════════════════════════════════════════════════
+// Lo usan agendar_cita Y gestionar_lead_crm(Calificado + fecha). Antes el
+// modelo a veces solo llamaba al CRM: el lead quedaba "Cita agendada" y el
+// bot confirmaba, pero la cita nunca entraba a la tabla appointments
+// (no aparecía en el calendario). Idempotente: si el lead ya tiene una cita
+// confirmada a esa misma hora (p.ej. ambas tools en el mismo turno), la reutiliza.
+async function bookFromChat(params: {
+    tenantId: string;
+    leadId: string;
+    phone: string;
+    nombreCliente: string;
+    fechaHora: string;
+    servicioNombre?: string;
+    notas?: string;
+    defaultDuration: number;
+}): Promise<{ success: true; appointmentId: string; created: boolean } | { success: false; error: string }> {
+    const { tenantId, leadId, fechaHora } = params;
+
+    const { data: existing } = await supabaseAdmin
+        .from("appointments")
+        .select("id")
+        .eq("organization_id", tenantId)
+        .eq("lead_id", leadId)
+        .eq("status", "confirmed")
+        .eq("start_time", fechaHora)
+        .limit(1);
+    if (existing && existing.length > 0) {
+        return { success: true, appointmentId: existing[0].id, created: false };
+    }
+
+    let productId: string | undefined;
+    let duration = params.defaultDuration;
+    if (params.servicioNombre) {
+        const { data: matchProduct } = await supabaseAdmin.from("products")
+            .select("id, attributes")
+            .eq("organization_id", tenantId)
+            .ilike("name", `%${params.servicioNombre}%`)
+            .limit(1);
+        if (matchProduct?.[0]) {
+            productId = matchProduct[0].id;
+            if (matchProduct[0].attributes?.duracion) {
+                duration = Number(matchProduct[0].attributes.duracion);
+            }
+        }
+    }
+
+    const start = new Date(fechaHora);
+    if (isNaN(start.getTime())) {
+        return { success: false, error: `Fecha/hora inválida: ${fechaHora}` };
+    }
+    const endTime = new Date(start.getTime() + duration * 60000).toISOString();
+    const servicio = params.servicioNombre || "Visita";
+
+    const result = await bookAppointment({
+        orgId: tenantId,
+        leadId,
+        productId,
+        startTime: fechaHora,
+        endTime,
+        notes: params.notas || `Cita para ${servicio}. Cliente: ${params.nombreCliente}`,
+    });
+    if (!result.success) {
+        return { success: false, error: result.error || "Error al crear la cita." };
+    }
+
+    // Update lead name if still generic
+    const { data: currentLead } = await supabaseAdmin
+        .from("leads")
+        .select("name")
+        .eq("id", leadId)
+        .single();
+    if (currentLead?.name === "Lead WhatsApp" || currentLead?.name?.startsWith("Lead")) {
+        await supabaseAdmin.from("leads").update({ name: params.nombreCliente }).eq("id", leadId);
+    }
+
+    // Send confirmation — try template first, fallback to text
+    const confirmFallback = `✅ *Cita confirmada*\nServicio: ${servicio}\nFecha: ${formatChileDate(fechaHora)}\n\n¡Te esperamos!\n\nPara cancelar o cambiar tu cita, escribe "cancelar cita" o "cambiar cita".`;
+    sendAutoTemplate({
+        orgId: tenantId,
+        leadId,
+        phone: params.phone,
+        event: "appointment_confirmed",
+        parameters: [params.nombreCliente || "", servicio, formatChileDate(fechaHora)],
+        fallbackText: confirmFallback,
+    }).catch(err => console.error("[AutoTemplate] Confirm error:", err));
+
+    return { success: true, appointmentId: result.appointment.id, created: true };
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  POST handler — Dynamic Multi-Tenant Webhook
 // ═══════════════════════════════════════════════════════════════
 export async function POST(
@@ -1190,6 +1281,7 @@ FLUJO OBLIGATORIO:
 2. Ofrece 2-3 horarios disponibles
 3. Cliente elige → confirma fecha + hora + servicio
 4. Usa agendar_cita (esto actualiza el CRM automáticamente)
+5. SOLO dile al cliente que la cita quedó agendada si la herramienta respondió exito: true (o cita_en_agenda: true). Si respondió error, NO confirmes: ofrece otro horario.
 
 REGLAS DE REPROGRAMACIÓN:
 ${rescheduleText}
@@ -1279,6 +1371,39 @@ ${hoursText}
                     } = validation.data;
 
                     console.log(`🔧 [${t.name}] Tool call: ${estado_filtro} — ${nombre_cliente}`);
+
+                    // ── Calificado con fecha = la cita DEBE existir en la agenda ──
+                    // Si falla (horario ocupado, fuera de rango), no movemos el lead
+                    // y le decimos al modelo que NO confirme.
+                    let crmAppointmentId: string | undefined;
+                    if (estado_filtro === "Calificado" && fecha_hora_cita && hasAppointmentConfig && leadId) {
+                        const booking = await bookFromChat({
+                            tenantId,
+                            leadId,
+                            phone: phoneClean,
+                            nombreCliente: nombre_cliente,
+                            fechaHora: fecha_hora_cita,
+                            notas: resumen_conversacion,
+                            defaultDuration: appointmentConfig.slot_duration_minutes,
+                        });
+                        if (!booking.success) {
+                            console.warn(`📅 [${t.name}] CRM Calificado sin cita: ${booking.error}`);
+                            currentTurnMessages.push({
+                                role: "tool",
+                                tool_call_id: toolCall.id,
+                                content: JSON.stringify({
+                                    success: false,
+                                    error: `La cita NO quedó registrada en la agenda: ${booking.error}`,
+                                    mensaje: "NO confirmes la cita al cliente. Ofrécele otro horario disponible.",
+                                }),
+                            });
+                            continue;
+                        }
+                        crmAppointmentId = booking.appointmentId;
+                        if (booking.created) {
+                            console.log(`📅 [${t.name}] Cita creada desde CRM tool: ${nombre_cliente} ${fecha_hora_cita}`);
+                        }
+                    }
 
                     // ── Find target stage (State Machine Logic) ────
                     // Load ALL stages for intelligent matching
@@ -1515,6 +1640,11 @@ ${hoursText}
                             success: true,
                             estado: estado_filtro,
                             message: `Lead ${nombre_cliente} registrado como ${estado_filtro}`,
+                            ...(crmAppointmentId && {
+                                cita_en_agenda: true,
+                                appointment_id: crmAppointmentId,
+                                fecha_cita: formatChileDate(fecha_hora_cita!),
+                            }),
                         }),
                     });
                 } else if (toolCall.function.name === "verificar_disponibilidad") {
@@ -1554,65 +1684,27 @@ ${hoursText}
                 } else if (toolCall.function.name === "agendar_cita") {
                     const args = JSON.parse(toolCall.function.arguments);
 
-                    // Look up product
-                    let productId: string | undefined;
-                    let duration = appointmentConfig.slot_duration_minutes;
-                    if (args.servicio_nombre) {
-                        const { data: matchProduct } = await supabaseAdmin.from("products")
-                            .select("id, attributes")
-                            .eq("organization_id", tenantId)
-                            .ilike("name", `%${args.servicio_nombre}%`)
-                            .limit(1);
-                        if (matchProduct?.[0]) {
-                            productId = matchProduct[0].id;
-                            if (matchProduct[0].attributes?.duracion) {
-                                duration = Number(matchProduct[0].attributes.duracion);
-                            }
-                        }
-                    }
-
-                    const startTime = args.fecha_hora;
-                    const endDate = new Date(new Date(startTime).getTime() + duration * 60000);
-                    const endTime = endDate.toISOString();
-
-                    const result = await bookAppointment({
-                        orgId: tenantId,
-                        leadId: leadId!,
-                        productId,
-                        startTime,
-                        endTime,
-                        notes: args.notas || `Cita para ${args.servicio_nombre}. Cliente: ${args.nombre_cliente}`,
-                    });
+                    const result = leadId
+                        ? await bookFromChat({
+                            tenantId,
+                            leadId,
+                            phone: phoneClean,
+                            nombreCliente: args.nombre_cliente,
+                            fechaHora: args.fecha_hora,
+                            servicioNombre: args.servicio_nombre,
+                            notas: args.notas,
+                            defaultDuration: appointmentConfig.slot_duration_minutes,
+                        })
+                        : { success: false as const, error: "Lead no encontrado." };
 
                     if (result.success) {
-                        // Update lead name if still generic
-                        const { data: currentLead } = await supabaseAdmin
-                            .from("leads")
-                            .select("name")
-                            .eq("id", leadId!)
-                            .single();
-                        if (currentLead?.name === "Lead WhatsApp" || currentLead?.name?.startsWith("Lead")) {
-                            await supabaseAdmin.from("leads").update({ name: args.nombre_cliente }).eq("id", leadId!);
-                        }
-
-                        // Send confirmation — try template first, fallback to text
-                        const confirmFallback = `✅ *Cita confirmada*\nServicio: ${args.servicio_nombre}\nFecha: ${formatChileDate(startTime)}\n\n¡Te esperamos!\n\nPara cancelar o cambiar tu cita, escribe "cancelar cita" o "cambiar cita".`;
-                        sendAutoTemplate({
-                            orgId: tenantId,
-                            leadId: leadId!,
-                            phone: phoneClean,
-                            event: "appointment_confirmed",
-                            parameters: [args.nombre_cliente || "", args.servicio_nombre || "", formatChileDate(startTime)],
-                            fallbackText: confirmFallback,
-                        }).catch(err => console.error("[AutoTemplate] Confirm error:", err));
-
                         currentTurnMessages.push({
                             role: "tool",
                             tool_call_id: toolCall.id,
                             content: JSON.stringify({
                                 exito: true,
-                                mensaje: `Cita agendada exitosamente para ${formatChileDate(startTime)}.`,
-                                appointment_id: result.appointment.id,
+                                mensaje: `Cita agendada exitosamente para ${formatChileDate(args.fecha_hora)}.`,
+                                appointment_id: result.appointmentId,
                             }),
                         });
                     } else {
