@@ -1377,6 +1377,32 @@ ${hoursText}
                     // y le decimos al modelo que NO confirme.
                     let crmAppointmentId: string | undefined;
                     if (estado_filtro === "Calificado" && fecha_hora_cita && hasAppointmentConfig && leadId) {
+                        // Si ya tiene OTRA cita futura confirmada, esto es un cambio de
+                        // hora: no creamos una segunda cita (eso lo hace
+                        // gestionar_cita_existente, que respeta la política de reprogramación).
+                        const { data: upcoming } = await supabaseAdmin
+                            .from("appointments")
+                            .select("id, start_time")
+                            .eq("organization_id", tenantId)
+                            .eq("lead_id", leadId)
+                            .eq("status", "confirmed")
+                            .gte("start_time", new Date().toISOString())
+                            .neq("start_time", fecha_hora_cita)
+                            .limit(1);
+                        if (upcoming && upcoming.length > 0) {
+                            console.warn(`📅 [${t.name}] CRM Calificado con otra cita vigente (${upcoming[0].start_time}) — no se duplica`);
+                            currentTurnMessages.push({
+                                role: "tool",
+                                tool_call_id: toolCall.id,
+                                content: JSON.stringify({
+                                    success: false,
+                                    error: `El cliente ya tiene una cita confirmada para ${formatChileDate(upcoming[0].start_time)}. La nueva hora NO quedó registrada.`,
+                                    mensaje: "NO confirmes la nueva hora. Si el cliente quiere cambiar su cita, usa gestionar_cita_existente con accion='reprogramar'.",
+                                }),
+                            });
+                            continue;
+                        }
+
                         const booking = await bookFromChat({
                             tenantId,
                             leadId,
